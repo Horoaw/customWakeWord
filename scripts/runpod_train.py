@@ -207,7 +207,8 @@ exec tail -f /dev/null
 
 
 def build_payload(project: str, repo_url: str, branch: str, hf_repo_id: str | None,
-                  gpu_type_id: str = GPU_TYPE_ID) -> dict:
+                  gpu_type_id: str = GPU_TYPE_ID,
+                  cloud_type: str = CLOUD_TYPE) -> dict:
     return {
         "name": f"customwake-{project}",
         "imageName": IMAGE,
@@ -218,7 +219,7 @@ def build_payload(project: str, repo_url: str, branch: str, hf_repo_id: str | No
         "volumeInGb": 50,
         "ports": ["8001/http"],
         "interruptible": False,
-        "cloudType": CLOUD_TYPE,
+        "cloudType": cloud_type,
         "supportPublicIp": True,
         "env": {
             "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
@@ -278,6 +279,10 @@ def main() -> int:
                     help="If set, upload artefact + manifest to HF Hub.")
     ap.add_argument("--gpu", default=GPU_TYPE_ID,
                     help="RunPod GPU type ID. Default: %(default)s")
+    ap.add_argument("--cloud-type", default=CLOUD_TYPE, choices=["SECURE", "COMMUNITY"],
+                    help="RunPod cloud type. COMMUNITY is cheaper but spot-interruptible.")
+    ap.add_argument("--hourly-rate", type=float, default=HOURLY_RATE,
+                    help="Hourly rate of the chosen GPU (for cost cap display).")
     ap.add_argument("--keep-pod", action="store_true",
                     help="Do not stop the pod on completion (for manual inspection).")
     ap.add_argument("--dry-run", action="store_true",
@@ -285,11 +290,12 @@ def main() -> int:
     args = ap.parse_args()
 
     payload = build_payload(args.project, args.repo_url, args.branch,
-                            args.hf_repo_id, gpu_type_id=args.gpu)
+                            args.hf_repo_id, gpu_type_id=args.gpu,
+                            cloud_type=args.cloud_type)
 
-    print(f"GPU:    {args.gpu} {CLOUD_TYPE}", flush=True)
+    print(f"GPU:    {args.gpu} {args.cloud_type}", flush=True)
     print(f"Image:  {IMAGE}", flush=True)
-    print(f"Rate:   ${HOURLY_RATE}/hr (cap ~${HOURLY_RATE * MAX_WAIT_S/3600:.2f})", flush=True)
+    print(f"Rate:   ${args.hourly_rate}/hr (cap ~${args.hourly_rate * MAX_WAIT_S/3600:.2f})", flush=True)
     print(f"Project: {args.project}", flush=True)
     if args.hf_repo_id:
         print(f"HF repo: {args.hf_repo_id}", flush=True)
