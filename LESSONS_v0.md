@@ -195,6 +195,24 @@ That way `pod id:` lines appear in real time, and retry_launch can pattern-match
 
 ---
 
+## 13. GPU host class matters more than GPU compute for this workload
+
+**Observation (added 2026-05-15, second session)**: same image, same entrypoint, same pip install — wildly different speed across hosts.
+
+| GPU host | pip install wall | HF 9GB download wall | Notes |
+|---|---|---|---|
+| 4090 SECURE (consumer DC, 41-62 GB host mem) | ~40 min | >2 h (didn't complete) | Choked on HF Hub egress |
+| A100 SXM 80GB (server class, datacenter mem) | ~40 min | partial — couldn't measure due to log-OOM | Faster network than 4090, killed by separate issue |
+| A40 SECURE 48GB (server class, 50 GB host mem) | **~15 min** (2.5× faster) | TBD this run | Server-class network |
+
+**Root cause**: RunPod's consumer-GPU pods (4090, 3090) live in budget datacenters with shared 1-2 Gbps NICs and no peering to HF Hub's CDN. Server-class GPUs (A40, A100, L40, H100) live in tier-1 datacenters with 10-25 Gbps NICs and direct or near-direct peering to major content networks. For this pipeline, **network bandwidth is the dominant cost** (40 min pip + 60+ min HF download), so paying $0.44/hr for an A40 beats $0.69/hr for a 4090 on total cost.
+
+**Fix applied** (commit `679bf7c`): updated `scripts/retry_launch.sh` GPU ordering to prefer A100 → L40S → L40 → A40 ahead of 4090/3090. Consumer GPUs are now fallbacks, not defaults.
+
+**v0.1 patch**: bake this learning into `configs/preferred_provider.txt` + `runpod_train.py --gpu-tier server` flag so default behavior is server-class.
+
+---
+
 ## Compounding cost across this session
 
 | Failure mode | Wasted $ | Count |

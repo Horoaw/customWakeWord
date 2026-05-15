@@ -13,6 +13,19 @@ Decision record + reference table for picking a GPU provider when launching trai
 
 ---
 
+## Within-RunPod tier matters
+
+Observed 2026-05-15: **GPU tier on RunPod is a bigger lever than compute speed for this workload.**
+
+| RunPod tier | Pod $/hr | pip install | HF 9 GB download |
+|---|---|---|---|
+| **Server-class** (A100/A40/L40/L40S, server DC, 10+ Gbps NIC) | $0.44-$1.39 | **~15 min** | minutes |
+| **Consumer-class** (4090/3090, budget DC, 1-2 Gbps NIC) | $0.34-$0.69 | ~40 min | hours |
+
+The 2-3× compute markup on A40 vs 4090 is fully recovered by network speed. **Pick server-class first on RunPod** unless cost-minimizing is the absolute priority — see `retry_launch.sh` for the canonical ordering (A100 → L40S → L40 → A40 → 4090 → 3090).
+
+---
+
 ## Decision matrix
 
 | Provider | A100 80GB rate | Setup effort for me | Reliability | Network | Lock-in |
