@@ -30,7 +30,7 @@ for f in hf.env runpod.env; do
     set +a
 done
 
-for f in gh.env together.env; do
+for f in gh.env together.env lambda.env; do
     if [ -f "${CREDS_DIR}/${f}" ]; then
         set -a
         source "${CREDS_DIR}/${f}"
