@@ -121,7 +121,9 @@ touch /workspace/setup.log
 (cd /workspace && python3 -m http.server 8001) >> /workspace/logserver.log 2>&1 &
 
 (
-    set -ex
+    # -e: abort on error; -x: trace; -o pipefail: abort if any pipe stage fails
+    # (needed because we route `git clone` through `sed` to scrub the token).
+    set -exo pipefail
 
     echo "[$(date +%H:%M:%S)] starting pod setup"
     echo "[$(date +%H:%M:%S)] base python: $(python3 --version 2>&1)"
@@ -138,7 +140,15 @@ touch /workspace/setup.log
     apt-get install -y -qq python3.10 python3.10-venv python3.10-dev python3.10-distutils
     echo "[$(date +%H:%M:%S)] python3.10 installed: $(python3.10 --version)"
 
-    git clone --branch {branch} "{repo_url}" /workspace/customwake
+    # Private repo — auth via GH_TOKEN env var injected into the pod payload.
+    # Temporarily disable `set -x` so the token-bearing URL isn't echoed into
+    # /workspace/setup.log (which is publicly served on :8001 via the proxy).
+    repo_path=$(echo "{repo_url}" | sed -E 's|^https://github.com/||; s|\.git$||')
+    {{ set +x; }} 2>/dev/null
+    git clone --branch {branch} \
+        "https://x-access-token:${{GH_TOKEN}}@github.com/${{repo_path}}.git" \
+        /workspace/customwake 2>&1 | sed -E 's|x-access-token:[^@]*@|x-access-token:***@|g'
+    {{ set -x; }} 2>/dev/null
     cd /workspace/customwake
 
     # Fresh venv on Python 3.10 — base image's torch is unused.
