@@ -16,11 +16,15 @@ cd "$(dirname "$0")/.."
 source scripts/load_creds.sh
 
 # Preferred GPU pools in priority order. Format: "GPU_ID:CLOUD:HOURLY_RATE".
+# Premium-first ordering — higher-tier hosts have meaningfully better network
+# egress (observed 2026-05-15: 4090 SECURE choked on 9 GB HF Hub download for
+# >2h; A100 SXM completed the same set in minutes per LESSONS_v0.md).
 GPUS=(
-    "NVIDIA GeForce RTX 4090:SECURE:0.69"
-    "NVIDIA A40:SECURE:0.44"
-    "NVIDIA L40:SECURE:0.69"
+    "NVIDIA A100-SXM4-80GB:SECURE:1.39"
     "NVIDIA L40S:SECURE:0.79"
+    "NVIDIA L40:SECURE:0.69"
+    "NVIDIA A40:SECURE:0.44"
+    "NVIDIA GeForce RTX 4090:SECURE:0.69"
     "NVIDIA GeForce RTX 3090:SECURE:0.22"
     "NVIDIA GeForce RTX 4090:COMMUNITY:0.34"
 )
