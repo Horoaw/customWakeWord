@@ -262,9 +262,12 @@ def wait_for_done(pod_id: str) -> bool:
             print("  --- end tail ---", flush=True)
             last_log_dump = elapsed
 
-        # Pull + boot can take 8-12 min on a fresh GPU. Be generous.
-        if elapsed >= 15 * 60 and runtime_obj is None:
-            raise RuntimeError("STUCK: pod runtime null after 15 min — likely image-pull failure or no GPU capacity")
+        # Observed: a healthy host boots within 3-4 min on a cached image. Lower
+        # hosts (≤41GB mem on 4090) repeatedly hang at uptime=0. Trip the STUCK
+        # detector at 7 min so retry_launch.sh can cycle to the next pool faster.
+        # ~$0.08 wasted per stuck attempt at 4090 rates.
+        if elapsed >= 7 * 60 and runtime_obj is None:
+            raise RuntimeError("STUCK: pod runtime null after 7 min — likely bad host; retry")
 
         time.sleep(60)
     return False
