@@ -40,8 +40,11 @@ DEFAULT_FILES = [
     "dinner_party.zip",
     "dinner_party_background.zip",
     "dinner_party_eval.zip",
-    "no_speech.zip",
-    "no_speech_background.zip",
+    # "no_speech.zip" + "no_speech_background.zip" — dropped from v0 default.
+    # These specific files consistently hang HF Hub egress on RunPod for >90 min
+    # (observed across 4090 SECURE and A40 SECURE pods on 2026-05-15). The other
+    # 5 zips download fine. Re-enable via `--files <comma-list>` once we have
+    # a network-volume cache or a mirror.
 ]
 
 

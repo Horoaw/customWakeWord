@@ -60,13 +60,9 @@ features:
     truncation_strategy: random
     type: mmap
 
-  # 5. FMA music + FSD50K noise + WHAM (no speech)
-  - features_dir: data/negative_datasets/no_speech
-    sampling_weight: 5.0
-    penalty_weight: 1.0
-    truth: false
-    truncation_strategy: random
-    type: mmap
+  # 5. (DROPPED for v0) FMA music + FSD50K noise + WHAM — `no_speech.zip` choked
+  # on RunPod->HF Hub egress for 90+ min across two runs. Re-enable in v0.1
+  # once we pre-cache the zips on a network volume.
 
   # 6. CHiME6 dev/eval — sampling_weight=0 means it's only used at val/test.
   - features_dir: data/negative_datasets/dinner_party_eval
