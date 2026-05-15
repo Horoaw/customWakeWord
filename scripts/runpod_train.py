@@ -104,12 +104,13 @@ def build_train_script(project: str, repo_url: str, branch: str,
     upload_block = ""
     if hf_repo_id:
         upload_block = (
-            f"\necho \"[$(date +%H:%M:%S)] uploading to HF\"\n"
-            f"python scripts/upload_to_hf.py --project {project} "
-            f"--model models/{project}-wakeword-v0.tflite "
-            f"--repo-id {hf_repo_id} "
-            f"--eval-json eval/results/{project}-v0__latest.json "
-            f"--esphome configs/examples/{project}/manifest.json\n"
+            f"\n    write_stage \"upload_to_hf\"\n"
+            f"    echo \"[$(date +%H:%M:%S)] uploading to HF\"\n"
+            f"    python scripts/upload_to_hf.py --project {project} \\\n"
+            f"        --model models/{project}-wakeword-v0.tflite \\\n"
+            f"        --repo-id {hf_repo_id} \\\n"
+            f"        --eval-json eval/results/{project}-v0__latest.json \\\n"
+            f"        --esphome configs/examples/{project}/manifest.json\n"
         )
 
     return rf"""
@@ -117,15 +118,39 @@ mkdir -p /workspace
 cd /workspace
 touch /workspace/setup.log
 
-# Log server on :8001 — survives any subshell crash.
-(cd /workspace && python3 -m http.server 8001) >> /workspace/logserver.log 2>&1 &
+# Stage marker file — updated at every pipeline step. Tiny (<100 bytes),
+# served via :8001/STAGE. Survives even if setup.log gets clobbered.
+echo "boot" > /workspace/STAGE
+echo "$(date +%H:%M:%S)" > /workspace/STAGE_TIME
+
+# Self-restarting log server with low OOM priority — was killed during
+# pip's heavy install in v0 (LESSONS_v0.md #8). The `while true` loop
+# restarts it if it ever dies; oom_score_adj=-1000 makes it the LAST
+# process the kernel picks during memory pressure.
+(
+    while true; do
+        cd /workspace
+        # Set very low OOM priority so the http.server is last to be killed.
+        echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
+        nice -n 19 python3 -m http.server 8001 2>/dev/null
+        echo "[$(date +%H:%M:%S)] log server died, restarting in 2s" >> /workspace/logserver.log
+        sleep 2
+    done
+) >> /workspace/logserver.log 2>&1 &
+disown
 
 (
     # -e: abort on error; -x: trace; -o pipefail: abort if any pipe stage fails
-    # (needed because we route `git clone` through `sed` to scrub the token).
     set -exo pipefail
 
-    echo "[$(date +%H:%M:%S)] starting pod setup"
+    # Helper: write a 1-line stage marker. Read externally via :8001/STAGE.
+    write_stage() {{
+        echo "$1" > /workspace/STAGE
+        date +"%H:%M:%S" > /workspace/STAGE_TIME
+        echo "[$(date +%H:%M:%S)] STAGE: $1"
+    }}
+
+    write_stage "apt_install"
     echo "[$(date +%H:%M:%S)] base python: $(python3 --version 2>&1)"
 
     export DEBIAN_FRONTEND=noninteractive
@@ -133,16 +158,15 @@ touch /workspace/setup.log
     apt-get install -y -qq ffmpeg sox libsox-fmt-mp3 unzip wget git \
         software-properties-common build-essential
 
-    # Install Python 3.10 from deadsnakes — microwakeword pins >=3.10,<3.11
-    # (see OHF-Voice/micro-wake-word issue #62 for the Python 3.11 break).
+    write_stage "python310_install"
     add-apt-repository ppa:deadsnakes/ppa -y
     apt-get update -qq
     apt-get install -y -qq python3.10 python3.10-venv python3.10-dev python3.10-distutils
     echo "[$(date +%H:%M:%S)] python3.10 installed: $(python3.10 --version)"
 
+    write_stage "git_clone"
     # Private repo — auth via GH_TOKEN env var injected into the pod payload.
-    # Temporarily disable `set -x` so the token-bearing URL isn't echoed into
-    # /workspace/setup.log (which is publicly served on :8001 via the proxy).
+    # Temporarily disable `set -x` so the token-bearing URL isn't echoed.
     repo_path=$(echo "{repo_url}" | sed -E 's|^https://github.com/||; s|\.git$||')
     {{ set +x; }} 2>/dev/null
     git clone --branch {branch} \
@@ -151,42 +175,49 @@ touch /workspace/setup.log
     {{ set -x; }} 2>/dev/null
     cd /workspace/customwake
 
-    # Fresh venv on Python 3.10 — base image's torch is unused.
+    write_stage "venv_create"
     python3.10 -m venv /workspace/.venv
     source /workspace/.venv/bin/activate
     pip install --upgrade pip wheel
 
+    write_stage "pip_install_requirements"
     pip install --no-cache-dir -r requirements.txt
     echo "[$(date +%H:%M:%S)] deps installed: $(python --version)"
 
     # 1. Positives
+    write_stage "synth_positives"
     if [ ! -s "data/{project}/synth/positives/manifest.jsonl" ]; then
         python scripts/synth_positives.py --project {project} \
             --psg-dir /workspace/piper-sample-generator
     fi
 
     # 2. Hard negatives
+    write_stage "synth_hard_negatives"
     if [ ! -s "data/{project}/synth/hard_negatives/manifest.jsonl" ]; then
         python scripts/synth_hard_negatives.py --project {project} \
             --psg-dir /workspace/piper-sample-generator
     fi
 
     # 3. Bulk negatives (HF mmap zips)
+    write_stage "download_hf_negatives"
     if [ ! -d "data/negative_datasets/speech" ]; then
         python scripts/download_hf_negatives.py --out data/negative_datasets
     fi
 
     # 4. Features
+    write_stage "build_features"
     if [ ! -d "data/{project}/features/training/wakeword_mmap" ]; then
         python scripts/build_features.py --project {project} \
             --download-aug-corpora
     fi
 
     # 5. Train + INT8 export
+    write_stage "train"
     python scripts/train_microwakeword.py --project {project} \
         --training-config configs/examples/{project}/training_parameters.yaml
 
     # 6. Eval against held-out tasks (if seeded)
+    write_stage "eval"
     if [ -d "eval/tasks/{project}" ]; then
         python -m eval.runner --project {project} \
             --model models/{project}-wakeword-v0.tflite \
@@ -196,8 +227,10 @@ touch /workspace/setup.log
     fi
 
     # 7. Emit manifest
+    write_stage "emit_manifest"
     python scripts/emit_manifest.py --project {project}
     {upload_block}
+    write_stage "done"
     echo "[$(date +%H:%M:%S)] DONE"
     touch /workspace/_done
 ) > /workspace/setup.log 2>&1 &
