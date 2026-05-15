@@ -38,8 +38,11 @@ GQL = "https://api.runpod.io/graphql"
 # A-spec fallback if 4090 is unavailable.
 GPU_TYPE_ID = "NVIDIA GeForce RTX 4090"
 CLOUD_TYPE = "SECURE"
-# Pinned to a Python 3.10 PyTorch image to dodge microwakeword #62.
-IMAGE = "runpod/pytorch:2.4.0-py3.10-cuda12.4.1-devel-ubuntu22.04"
+# Real RunPod pytorch tag (the "2.4.0-py3.10-..." format from 2024 docs is
+# obsolete — current catalog uses `1.0.3-cu1290-torch271-ubuntu2204`).
+# Ubuntu 22.04 ships system Python 3.10; we install python3.10 explicitly via
+# deadsnakes anyway so the base image's Python version doesn't matter.
+IMAGE = "runpod/pytorch:1.0.3-cu1290-torch271-ubuntu2204"
 HOURLY_RATE = 0.69
 
 MAX_WAIT_S = 4 * 60 * 60   # 4 h hard cap → ~$2.76 worst case
@@ -121,15 +124,30 @@ touch /workspace/setup.log
     set -ex
 
     echo "[$(date +%H:%M:%S)] starting pod setup"
+    echo "[$(date +%H:%M:%S)] base python: $(python3 --version 2>&1)"
+
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq ffmpeg sox libsox-fmt-mp3 unzip wget git
+    apt-get install -y -qq ffmpeg sox libsox-fmt-mp3 unzip wget git \
+        software-properties-common build-essential
+
+    # Install Python 3.10 from deadsnakes — microwakeword pins >=3.10,<3.11
+    # (see OHF-Voice/micro-wake-word issue #62 for the Python 3.11 break).
+    add-apt-repository ppa:deadsnakes/ppa -y
+    apt-get update -qq
+    apt-get install -y -qq python3.10 python3.10-venv python3.10-dev python3.10-distutils
+    echo "[$(date +%H:%M:%S)] python3.10 installed: $(python3.10 --version)"
 
     git clone --branch {branch} "{repo_url}" /workspace/customwake
     cd /workspace/customwake
 
-    # Pin transformers/torch is unnecessary — microwakeword pins what it needs.
+    # Fresh venv on Python 3.10 — base image's torch is unused.
+    python3.10 -m venv /workspace/.venv
+    source /workspace/.venv/bin/activate
+    pip install --upgrade pip wheel
+
     pip install --no-cache-dir -r requirements.txt
-    echo "[$(date +%H:%M:%S)] deps installed"
+    echo "[$(date +%H:%M:%S)] deps installed: $(python --version)"
 
     # 1. Positives
     if [ ! -s "data/{project}/synth/positives/manifest.jsonl" ]; then
@@ -233,8 +251,9 @@ def wait_for_done(pod_id: str) -> bool:
             print("  --- end tail ---", flush=True)
             last_log_dump = elapsed
 
-        if elapsed >= 10 * 60 and runtime_obj is None:
-            raise RuntimeError("STUCK: pod runtime null after 10 min")
+        # Pull + boot can take 8-12 min on a fresh GPU. Be generous.
+        if elapsed >= 15 * 60 and runtime_obj is None:
+            raise RuntimeError("STUCK: pod runtime null after 15 min — likely image-pull failure or no GPU capacity")
 
         time.sleep(60)
     return False
