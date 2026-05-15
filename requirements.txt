@@ -1,0 +1,42 @@
+# Core ML — TensorFlow for microWakeWord training
+tensorflow>=2.15,<2.18
+keras>=3.0
+microwakeword @ git+https://github.com/kahrendt/microWakeWord.git
+tflite-runtime>=2.14  # for local eval; on RunPod we use the full TF
+
+# TTS engines
+piper-tts>=1.2  # if pip install fails on Mac, fall back to the precompiled binary
+kokoro>=0.1     # Kokoro-82M python wrapper (huggingface)
+# MeloTTS — install separately via `pip install git+https://github.com/myshell-ai/MeloTTS.git`
+# Parler-TTS — `pip install git+https://github.com/huggingface/parler-tts.git`
+
+# Audio
+librosa>=0.10
+soundfile>=0.12
+audiomentations>=0.36
+torch-audiomentations>=0.11
+pyroomacoustics>=0.7
+ffmpeg-python>=0.2
+
+# Datasets / downloaders
+datasets>=3.0
+requests>=2.31
+tqdm>=4.66
+
+# Eval + utilities
+numpy>=1.26,<2.0
+scipy>=1.11
+pandas>=2.1
+pyyaml>=6.0
+jsonlines>=4.0
+rich>=13.7
+
+# API clients
+huggingface_hub>=0.24
+runpod>=1.7
+openai>=1.40  # if we plug into a hosted TTS API later
+together>=1.4  # optional, only if using Together-hosted models for anything
+
+# Dev
+pytest>=8.0
+ruff>=0.6

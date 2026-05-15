@@ -1,0 +1,13 @@
+{
+  "id": "neg_example_rhyme",
+  "audio_path": "eval/tasks/examples/hey_doofus_example.wav",
+  "label": "hard_negative",
+  "bucket_id": "rhyme_collisions",
+  "phrase": "hey doofus",
+  "expected": "no_fire",
+  "metadata": {
+    "voice": "en_US-amy-medium",
+    "engine": "piper",
+    "speed": 1.0
+  }
+}

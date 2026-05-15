@@ -1,0 +1,112 @@
+# Adversarial / collision phrases. The model must NOT fire on these.
+#
+# Buckets group phrases that share a failure mode. Per-bucket FAR is reported
+# in eval JSONs.
+
+buckets:
+  - id: tu_fu_collision
+    target_count: 600
+    phrases:
+      - "to-do list"
+      - "what's on the to-do list"
+      - "to do"
+      - "to go"
+      - "to-go order"
+      - "to you"
+      - "thanks to you"
+      - "two-fold"
+      - "to-go cup"
+      - "she said to do it"
+
+  - id: doofus_rhyme
+    target_count: 400
+    phrases:
+      - "hey doofus"
+      - "hi doofus"
+      - "you doofus"
+      - "what a doofus"
+      - "hey goof"
+      - "hi goof"
+
+  - id: greeting_no_tofu
+    target_count: 300
+    phrases:
+      - "hey there"
+      - "hi there"
+      - "hello world"
+      - "hey buddy"
+      - "hi buddy"
+      - "hey friend"
+      - "hello friend"
+      - "hey you"
+      - "hi mom"
+
+  - id: tofu_no_greeting
+    target_count: 500
+    phrases:
+      - "tofu"
+      - "tofu salad"
+      - "tofu scramble"
+      - "I love tofu"
+      - "this tofu is amazing"
+      - "do we have tofu"
+      - "where is the tofu"
+
+  - id: food_context
+    target_count: 300
+    phrases:
+      - "tofu burger"
+      - "fried tofu"
+      - "silken tofu"
+      - "marinated tofu"
+      - "smoked tofu"
+      - "soft tofu"
+      - "firm tofu"
+      - "extra firm tofu"
+
+  - id: disyllabic_tu
+    target_count: 200
+    phrases:
+      - "tutu"
+      - "her tutu"
+      - "two pugs"
+      - "two pups"
+      - "to-do"
+      - "Tutu"   # the South African archbishop / a name
+
+  - id: near_match
+    target_count: 200
+    phrases:
+      - "toad"
+      - "phew"
+      - "ufo"
+      - "boo who"
+      - "ho-fu"
+      - "go to"
+
+engines:
+  # same engine mix as positives for distribution parity
+  - name: piper
+    weight: 0.5
+    voices: ALL
+  - name: kokoro
+    weight: 0.25
+    voices: ALL_EN
+  - name: melotts
+    weight: 0.15
+    voices: [EN-US, EN-BR, EN-AU, EN-IN]
+  - name: parler
+    weight: 0.10
+    voices: [random_seed_grid_20]
+
+variation:
+  speeds: [0.85, 0.95, 1.05, 1.15]
+  random_seed: 4242
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  format: wav
+  trim_silence: true
+  target_duration_s: 1.5
+  pad_with_silence_if_short: true

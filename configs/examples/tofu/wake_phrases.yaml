@@ -1,0 +1,63 @@
+# Phrases we want the model to fire on.
+#
+# Each phrase entry is sampled at training time. The `count` field is the
+# absolute target after de-duplication; `weight` reweights loss per-sample.
+#
+# Variations: each phrase is expanded across speeds and emotions in
+# scripts/synth_positives.py before being routed to a TTS engine.
+
+phrases:
+  - text: "hey tofu"
+    count: 5000
+    weight: 1.0
+    notes: |
+      Most common wake. Train heavily.
+
+  - text: "hi tofu"
+    count: 2500
+    weight: 1.0
+
+  - text: "hello tofu"
+    count: 1500
+    weight: 0.8
+
+  - text: "okay tofu"
+    count: 1000
+    weight: 0.7
+    notes: |
+      Used by some adults as a command opener. Less common from kids.
+
+# TTS variation grid — every (voice, phrase) is rendered at each speed in the
+# list. Total renders ≈ count_per_phrase × len(speeds).
+# Engines fall back from top to bottom if a voice/phrase combo fails.
+variation:
+  speeds: [0.85, 0.95, 1.05, 1.15]
+  emotions:
+    parler:  # only used when engine == parler
+      - "speaking calmly, neutral"
+      - "speaking excitedly, slightly fast"
+      - "speaking softly, almost whispering"
+      - "speaking with a friendly child-like tone"
+  random_seed: 42
+
+engines:
+  - name: piper
+    weight: 0.5      # half of the dataset
+    voices: ALL      # use every Piper en-* voice
+  - name: kokoro
+    weight: 0.25
+    voices: ALL_EN   # every Kokoro English voice
+  - name: melotts
+    weight: 0.15
+    voices: [EN-US, EN-BR, EN-AU, EN-IN]
+  - name: parler
+    weight: 0.10
+    voices: [random_seed_grid_20]  # 20 random prompts via parler
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  format: wav
+  trim_silence: true
+  target_duration_s: 1.5
+  pad_with_silence_if_short: true

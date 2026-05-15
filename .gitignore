@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ML / model artifacts
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.gguf
+*.mlx
+checkpoints/
+runs/
+wandb/
+mlruns/
+outputs/
+logs/
+
+# Datasets (too large to track, must live elsewhere)
+data/raw/
+data/synth/
+data/clean/
+data/rir/
+data/noise/
+*.tfrecord
+*.parquet
+*.arrow
+
+# Audio (synthesized or downloaded)
+*.wav
+*.flac
+*.ogg
+*.opus
+*.mp3
+*.m4a
+*.aac
+# but keep tiny example WAVs under eval/tasks/ if they're checked in deliberately
+!eval/tasks/examples/*.wav
+
+# TFLite artefacts may be checked in deliberately under models/, but not in data dirs
+data/**/*.tflite
+# (root models/ is gitignored separately; explicit releases go via git-lfs or HF Hub)
+models/*.tflite
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project-specific
+local_notes/
+scratch/
+secrets/
+
+# Claude Code state (per-session, never commit)
+.claude/state/
+.claude/cache/

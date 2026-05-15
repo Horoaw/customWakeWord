@@ -1,0 +1,13 @@
+{
+  "id": "pos_example",
+  "audio_path": "eval/tasks/examples/hey_tofu_example.wav",
+  "label": "positive",
+  "phrase": "hey tofu",
+  "expected": "fire",
+  "metadata": {
+    "voice": "en_US-amy-medium",
+    "engine": "piper",
+    "speed": 1.0,
+    "note": "Replace this example with real eval/tasks/<project>/positives/*.json after running scripts/seed_eval_tasks.py."
+  }
+}

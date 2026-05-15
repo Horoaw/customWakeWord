@@ -1,0 +1,67 @@
+# microWakeWord training config consumed by scripts/train_microwakeword.py.
+
+model:
+  architecture: micro_wake_word_inception
+  inception:
+    n_blocks: 3
+    filters: [16, 32, 32]
+    kernel_strides: [3, 3, 3]
+    dropout: 0.1
+  features:
+    n_mels: 40
+    win_ms: 60
+    hop_ms: 25
+    n_frames: 194
+  head:
+    n_classes: 1                  # binary detector
+    sigmoid: true
+
+class_weights:
+  positive: 3.0
+  hard_negative: 2.0
+  bulk_negative: 1.0
+
+optimizer:
+  name: adam
+  learning_rate: 1.0e-3
+  schedule: cosine
+  warmup_steps: 500
+  weight_decay: 1.0e-5
+
+training:
+  batch_size: 256
+  epochs: 50
+  shuffle_buffer: 10000
+  prefetch: tf.data.AUTOTUNE
+  mixed_precision: true
+  early_stop:
+    metric: val_far_at_99_recall
+    patience: 5
+    mode: min
+    min_delta: 0.0
+  checkpoint:
+    every_n_epochs: 5
+    keep_top_k: 3
+    monitor: val_far_at_99_recall
+  logging:
+    steps: 50
+    tensorboard: false
+    wandb: false                  # flip on once a WANDB key is in load_creds.sh
+
+eval:
+  target_recall: 0.99
+  target_far_per_hour: 0.5
+  detection_threshold_grid: [0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95]
+
+quantization:
+  scheme: int8_ptq
+  representative_n: 1000
+  target_runtime: tflite_micro_esp32s3
+  # If post-training quantization drops recall by more than 0.5 pp, switch to
+  # quantization-aware training. v0 starts with PTQ to keep the loop simple.
+  fallback_to_qat: false
+
+hub:
+  repo_id: ""                     # filled in by upload_to_hf.py at release time
+  served_name: tofu-wakeword-v0
+  esphome_template: configs/esphome_tofu_template.yaml
