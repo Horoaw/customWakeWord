@@ -1,441 +1,188 @@
 #!/usr/bin/env python3
-"""Synthesize TTS positives for the Tofu wake-word.
+"""Synthesize positives for a wake-word project using piper-sample-generator.
 
-Reads `configs/wake_phrases.yaml`, fans out across registered TTS engines
-(Piper, Kokoro, MeloTTS, Parler-TTS) and their voices, and writes 16 kHz
-mono WAVs to `data/synth/positives/` along with a `manifest.jsonl` line
-per file.
+This is the canonical recipe path used by OHF-Voice/micro-wake-word's
+basic_training_notebook.ipynb. It shells out to piper-sample-generator
+(a separate repo at https://github.com/rhasspy/piper-sample-generator)
+which uses the `en_US-libritts_r-medium.pt` VITS generator model with
+**904 distinct speakers** + tempo/noise jitter for per-sample variation.
 
-Resumable: if `manifest.jsonl` already exists, this script picks up where
-it left off — useful because Mac CPU TTS for 10k samples can take ~30 min
-and you may want to interrupt.
+Reads `configs/examples/<project>/wake_phrases.yaml`. For each phrase,
+runs `piper-sample-generator/generate_samples.py "<phrase>" --max-samples N`
+into `data/<project>/synth/positives/<phrase_slug>/`. Writes a unified
+`manifest.jsonl` at the end so downstream `build_features.py` knows which
+WAVs belong to which phrase.
+
+Resumable: if a phrase's directory already has the requested sample count,
+that phrase is skipped.
 
 Usage:
-    python scripts/synth_positives.py \\
-        --phrases configs/wake_phrases.yaml \\
-        --out data/synth/positives \\
-        --count 10000
-
-The four engines are loaded lazily so a missing one (e.g. you didn't
-install MeloTTS) is degraded gracefully — that engine is just skipped.
+    python scripts/synth_positives.py --project tofu
+    python scripts/synth_positives.py --project tofu --count 20000  # override total
+    python scripts/synth_positives.py --project tofu --psg-dir ./piper-sample-generator
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import random
+import re
+import subprocess
 import sys
-import time
 from pathlib import Path
 
-try:
-    import yaml
-except ImportError:
-    print("ERROR: pip install pyyaml", file=sys.stderr); sys.exit(1)
+import yaml
 
 
-# -----------------------------------------------------------------------------
-# Engine adapters
-# -----------------------------------------------------------------------------
+REPO_URL_LINUX = "https://github.com/rhasspy/piper-sample-generator"
+REPO_URL_MPS = "https://github.com/kahrendt/piper-sample-generator"
+MPS_BRANCH = "mps-support"
+GEN_MODEL_URL = (
+    "https://github.com/rhasspy/piper-sample-generator/releases/download/"
+    "v2.0.0/en_US-libritts_r-medium.pt"
+)
+GEN_MODEL_NAME = "en_US-libritts_r-medium.pt"
 
-class _EngineBase:
-    name: str = "base"
-
-    def list_voices(self, hint) -> list[str]:
-        raise NotImplementedError
-
-    def synth(self, text: str, voice: str, speed: float, emotion: str | None,
-              out_path: Path, sample_rate: int) -> bool:
-        """Render `text` with `voice` at `speed` to `out_path`. Return True on success."""
-        raise NotImplementedError
-
-
-class PiperEngine(_EngineBase):
-    """Wraps `piper-tts` (pip) or the precompiled `piper` binary on Mac."""
-    name = "piper"
-
-    def __init__(self):
-        try:
-            from piper import PiperVoice  # noqa: F401
-            self._mode = "py"
-        except Exception:
-            import shutil
-            if shutil.which("piper"):
-                self._mode = "bin"
-            else:
-                raise RuntimeError(
-                    "piper not available (neither `pip install piper-tts` nor `piper` on PATH)"
-                )
-        self._voice_cache: dict[str, object] = {}
-
-    def list_voices(self, hint) -> list[str]:
-        # Conventional layout: ~/.local/share/piper/voices/<lang>/<voice>/*.onnx
-        # If the user only has a couple of voices installed, we use those.
-        # If hint == "ALL" we try every directory; if a list, we use only those.
-        voices_dir = Path.home() / ".local/share/piper/voices"
-        if not voices_dir.exists():
-            return []
-        all_voices: list[str] = []
-        for p in voices_dir.rglob("*.onnx"):
-            all_voices.append(p.stem)
-        if hint == "ALL":
-            return sorted(set(all_voices))
-        if isinstance(hint, list):
-            return [v for v in all_voices if v in hint]
-        return sorted(set(all_voices))
-
-    def synth(self, text, voice, speed, emotion, out_path, sample_rate):
-        # Piper exposes a length_scale knob: <1 = faster, >1 = slower.
-        # speed=1.05 → length_scale = 1/1.05 ≈ 0.952.
-        length_scale = 1.0 / max(speed, 0.1)
-        if self._mode == "py":
-            return self._synth_py(text, voice, length_scale, out_path, sample_rate)
-        return self._synth_bin(text, voice, length_scale, out_path, sample_rate)
-
-    def _synth_py(self, text, voice, length_scale, out_path, sample_rate):
-        from piper import PiperVoice
-        import wave
-        if voice not in self._voice_cache:
-            model_path = next(
-                (Path.home() / ".local/share/piper/voices").rglob(f"{voice}.onnx"),
-                None,
-            )
-            if model_path is None:
-                return False
-            self._voice_cache[voice] = PiperVoice.load(str(model_path))
-        v = self._voice_cache[voice]
-        with wave.open(str(out_path), "wb") as wf:
-            v.synthesize(text, wf, length_scale=length_scale)
-        return True
-
-    def _synth_bin(self, text, voice, length_scale, out_path, sample_rate):
-        import subprocess
-        model_path = next(
-            (Path.home() / ".local/share/piper/voices").rglob(f"{voice}.onnx"),
-            None,
-        )
-        if model_path is None:
-            return False
-        try:
-            subprocess.run(
-                ["piper", "--model", str(model_path),
-                 "--output_file", str(out_path),
-                 "--length_scale", str(length_scale)],
-                input=text.encode(), check=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            return True
-        except subprocess.CalledProcessError:
-            return False
-
-
-class KokoroEngine(_EngineBase):
-    name = "kokoro"
-
-    def __init__(self):
-        try:
-            from kokoro import KPipeline
-        except Exception as e:
-            raise RuntimeError(f"kokoro not installed: {e}")
-        # Lazy: only instantiate the pipeline for the languages we use.
-        self._pipelines: dict[str, "KPipeline"] = {}
-        self._KPipeline = KPipeline
-
-    def _get_pipeline(self, lang: str):
-        if lang not in self._pipelines:
-            self._pipelines[lang] = self._KPipeline(lang_code=lang)
-        return self._pipelines[lang]
-
-    def list_voices(self, hint) -> list[str]:
-        en_voices = [
-            "af_alloy", "af_aoede", "af_bella", "af_jessica",
-            "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
-            "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael",
-            "am_onyx", "am_puck", "am_santa",
-            "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
-            "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
-        ]
-        if hint == "ALL_EN" or hint == "ALL":
-            return en_voices
-        if isinstance(hint, list):
-            return [v for v in en_voices if v in hint]
-        return en_voices
-
-    def synth(self, text, voice, speed, emotion, out_path, sample_rate):
-        import numpy as np
-        import soundfile as sf
-        lang = "a" if voice.startswith(("af_", "am_")) else "b"
-        pipe = self._get_pipeline(lang)
-        audio_chunks: list[np.ndarray] = []
-        for _, _, audio in pipe(text, voice=voice, speed=speed):
-            audio_chunks.append(audio)
-        if not audio_chunks:
-            return False
-        full = np.concatenate(audio_chunks)
-        sf.write(str(out_path), full, sample_rate)
-        return True
-
-
-class MeloTTSEngine(_EngineBase):
-    name = "melotts"
-
-    def __init__(self):
-        try:
-            from melo.api import TTS
-        except Exception as e:
-            raise RuntimeError(f"MeloTTS not installed: {e}")
-        self._TTS = TTS
-        self._models: dict[str, object] = {}
-
-    def _get(self, voice):
-        if voice not in self._models:
-            self._models[voice] = self._TTS(language=voice, device="auto")
-        return self._models[voice]
-
-    def list_voices(self, hint) -> list[str]:
-        defaults = ["EN-US", "EN-BR", "EN-AU", "EN-IN"]
-        if isinstance(hint, list):
-            return [v for v in defaults if v in hint]
-        return defaults
-
-    def synth(self, text, voice, speed, emotion, out_path, sample_rate):
-        m = self._get(voice)
-        speaker_ids = m.hps.data.spk2id
-        speaker_id = next(iter(speaker_ids.values()))
-        m.tts_to_file(text, speaker_id, str(out_path), speed=speed)
-        return True
-
-
-class ParlerTTSEngine(_EngineBase):
-    name = "parler"
-
-    def __init__(self):
-        try:
-            from parler_tts import ParlerTTSForConditionalGeneration
-            from transformers import AutoTokenizer
-            import torch
-        except Exception as e:
-            raise RuntimeError(f"parler-tts not installed: {e}")
-        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-        self._device = device
-        self._tok = AutoTokenizer.from_pretrained("parler-tts/parler-tts-mini-v1")
-        self._model = ParlerTTSForConditionalGeneration.from_pretrained(
-            "parler-tts/parler-tts-mini-v1"
-        ).to(device)
-        self._torch = torch
-
-    def list_voices(self, hint) -> list[str]:
-        # Parler doesn't have discrete voices — "voice" is a free-text style prompt.
-        # We synthesize a fixed grid of 20 random style prompts at init.
-        rng = random.Random(2026)
-        bases = [
-            "a young woman", "a middle-aged man", "an elderly woman",
-            "a teenage boy", "a small child", "a young man with an Australian accent",
-            "a woman with a British accent", "a man with an Indian accent",
-            "a soft-spoken woman", "an excited man",
-        ]
-        moods = ["calmly", "excitedly", "warmly", "happily", "playfully"]
-        prompts = []
-        for _ in range(20):
-            prompts.append(f"{rng.choice(bases)} speaking {rng.choice(moods)}, clearly")
-        return prompts
-
-    def synth(self, text, voice, speed, emotion, out_path, sample_rate):
-        import soundfile as sf
-        full_prompt = voice if not emotion else f"{voice}; {emotion}"
-        desc = self._tok(full_prompt, return_tensors="pt").input_ids.to(self._device)
-        ids = self._tok(text, return_tensors="pt").input_ids.to(self._device)
-        with self._torch.no_grad():
-            gen = self._model.generate(input_ids=desc, prompt_input_ids=ids)
-        audio = gen.cpu().numpy().squeeze()
-        sf.write(str(out_path), audio, self._model.config.sampling_rate)
-        return True
-
-
-ENGINES_REGISTRY = {
-    "piper": PiperEngine,
-    "kokoro": KokoroEngine,
-    "melotts": MeloTTSEngine,
-    "parler": ParlerTTSEngine,
-}
-
-
-def load_engines(names: list[str]) -> dict[str, _EngineBase]:
-    out: dict[str, _EngineBase] = {}
-    for name in names:
-        cls = ENGINES_REGISTRY.get(name)
-        if not cls:
-            print(f"WARN: unknown engine {name}, skipping", file=sys.stderr)
-            continue
-        try:
-            out[name] = cls()
-            print(f"  ✓ engine loaded: {name}")
-        except Exception as e:
-            print(f"  ✗ engine {name} unavailable: {e}", file=sys.stderr)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Manifest + dispatch
-# -----------------------------------------------------------------------------
 
 def slug(text: str) -> str:
-    return "".join(c if c.isalnum() else "_" for c in text.lower()).strip("_")
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
-def file_id(voice: str, phrase: str, speed: float, emotion: str | None, seed: int) -> str:
-    h = hashlib.md5(f"{voice}|{phrase}|{speed}|{emotion}|{seed}".encode()).hexdigest()[:8]
-    return f"{slug(voice)[:24]}__{slug(phrase)[:32]}__{speed:.2f}__{h}"
+def ensure_psg(psg_dir: Path) -> Path:
+    """Clone piper-sample-generator + download the generator model if needed.
+
+    Auto-picks the MPS-support fork on Darwin.
+    """
+    if not psg_dir.exists():
+        import platform
+        if platform.system() == "Darwin":
+            print(f"  cloning {REPO_URL_MPS} (branch {MPS_BRANCH}) → {psg_dir}", flush=True)
+            subprocess.check_call([
+                "git", "clone", "-b", MPS_BRANCH, "--depth", "1",
+                REPO_URL_MPS, str(psg_dir),
+            ])
+        else:
+            print(f"  cloning {REPO_URL_LINUX} → {psg_dir}", flush=True)
+            subprocess.check_call([
+                "git", "clone", "--depth", "1", REPO_URL_LINUX, str(psg_dir),
+            ])
+
+    model_path = psg_dir / "models" / GEN_MODEL_NAME
+    if not model_path.exists():
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  downloading generator model → {model_path}", flush=True)
+        subprocess.check_call([
+            "wget", "-q", "--show-progress", "-O", str(model_path), GEN_MODEL_URL,
+        ])
+    return psg_dir
 
 
-def load_manifest(out_dir: Path) -> set[str]:
-    """Return set of file_ids already synthesized."""
-    mfp = out_dir / "manifest.jsonl"
-    if not mfp.exists():
-        return set()
-    seen = set()
-    for line in mfp.read_text().splitlines():
-        if not line.strip():
-            continue
-        d = json.loads(line)
-        seen.add(d["file_id"])
-    return seen
+def generate_for_phrase(psg_dir: Path, phrase: str, out_dir: Path,
+                        count: int, batch_size: int = 100,
+                        max_speakers: int | None = 904) -> int:
+    """Run piper-sample-generator for one phrase. Return number of WAVs produced."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    existing = list(out_dir.glob("*.wav"))
+    if len(existing) >= count:
+        print(f"  ✓ {phrase}: already have {len(existing)} ≥ {count}, skipping", flush=True)
+        return len(existing)
+
+    needed = count - len(existing)
+    print(f"  → {phrase}: generating {needed} more ({len(existing)} already on disk)", flush=True)
+
+    cmd = [
+        sys.executable, str(psg_dir / "generate_samples.py"),
+        phrase,
+        "--max-samples", str(needed),
+        "--batch-size", str(batch_size),
+        "--output-dir", str(out_dir),
+    ]
+    if max_speakers is not None:
+        cmd.extend(["--max-speakers", str(max_speakers)])
+
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as e:
+        print(f"  ✗ piper-sample-generator failed for '{phrase}': {e}", file=sys.stderr)
+        return len(list(out_dir.glob("*.wav")))
+
+    return len(list(out_dir.glob("*.wav")))
 
 
-def append_manifest(out_dir: Path, row: dict) -> None:
-    mfp = out_dir / "manifest.jsonl"
-    with mfp.open("a") as f:
-        f.write(json.dumps(row) + "\n")
-
-
-def plan_jobs(cfg: dict, engines: dict[str, _EngineBase], total_count: int) -> list[dict]:
-    """Build a flat list of (engine, voice, phrase, speed, emotion) jobs sampled
-    according to per-phrase counts and per-engine weights."""
-    rng = random.Random(cfg["variation"]["random_seed"])
-    phrases = cfg["phrases"]
-
-    # Per-phrase target counts, scaled to total_count if needed.
-    raw_total = sum(p["count"] for p in phrases)
-    scale = total_count / raw_total if raw_total else 1.0
-    per_phrase_count = {p["text"]: max(1, int(round(p["count"] * scale))) for p in phrases}
-
-    # Engine weights → cumulative distribution.
-    eng_weights = [(e["name"], float(e["weight"])) for e in cfg["engines"] if e["name"] in engines]
-    if not eng_weights:
-        return []
-    w_total = sum(w for _, w in eng_weights)
-    eng_cdf: list[tuple[str, float]] = []
-    cum = 0.0
-    for name, w in eng_weights:
-        cum += w / w_total
-        eng_cdf.append((name, cum))
-
-    speeds = cfg["variation"]["speeds"]
-    emotions_for: dict[str, list[str]] = cfg["variation"].get("emotions", {})
-
-    jobs: list[dict] = []
-    for phrase_cfg in phrases:
-        phrase = phrase_cfg["text"]
-        n = per_phrase_count[phrase]
-        for _ in range(n):
-            r = rng.random()
-            engine_name = next(name for name, cum in eng_cdf if r <= cum)
-            engine = engines[engine_name]
-            voice_hint = next((e.get("voices") for e in cfg["engines"] if e["name"] == engine_name), "ALL")
-            voice_list = engine.list_voices(voice_hint)
-            if not voice_list:
-                continue
-            voice = rng.choice(voice_list)
-            speed = rng.choice(speeds)
-            emotion = None
-            if engine_name in emotions_for:
-                emotion = rng.choice(emotions_for[engine_name])
-            seed = rng.randint(0, 2**31 - 1)
-            jobs.append({
-                "engine": engine_name,
-                "voice": voice,
-                "phrase": phrase,
-                "speed": speed,
-                "emotion": emotion,
-                "seed": seed,
-            })
-    rng.shuffle(jobs)
-    return jobs
+def write_manifest(positives_root: Path, by_phrase: dict[str, Path]) -> None:
+    """Write a single manifest.jsonl for downstream feature extraction."""
+    mfp = positives_root / "manifest.jsonl"
+    n = 0
+    with mfp.open("w") as f:
+        for phrase, phrase_dir in by_phrase.items():
+            for wav in sorted(phrase_dir.glob("*.wav")):
+                f.write(json.dumps({
+                    "file_id": wav.stem,
+                    "wav_path": str(wav),
+                    "phrase": phrase,
+                    "label": "positive",
+                    "engine": "piper_sample_generator",
+                    "voice_model": GEN_MODEL_NAME,
+                }) + "\n")
+                n += 1
+    print(f"  wrote {mfp} ({n} rows)", flush=True)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phrases", default="configs/wake_phrases.yaml")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--count", type=int, default=10000)
-    ap.add_argument("--engines", default="piper,kokoro,melotts,parler",
-                    help="Comma-separated subset of available engines")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Plan jobs, print summary, exit without synthesis")
+    ap.add_argument("--project", required=True,
+                    help="Project slug under configs/examples/")
+    ap.add_argument("--config", default=None,
+                    help="Path to wake_phrases.yaml (default: configs/examples/<project>/wake_phrases.yaml)")
+    ap.add_argument("--out", default=None,
+                    help="Output root (default: data/<project>/synth/positives)")
+    ap.add_argument("--count", type=int, default=None,
+                    help="Override total positive count (default: sum of per-phrase counts in YAML)")
+    ap.add_argument("--batch-size", type=int, default=100)
+    ap.add_argument("--max-speakers", type=int, default=904,
+                    help="Cap on Piper voice speaker count (default 904 = LibriTTS-R full).")
+    ap.add_argument("--psg-dir", default="piper-sample-generator",
+                    help="Where to clone piper-sample-generator (default ./piper-sample-generator)")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.phrases).read_text())
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"=== Tofu wake-word positive synthesis ===")
-    print(f"  config:  {args.phrases}")
-    print(f"  out:     {out_dir}")
-    print(f"  count:   {args.count}")
-    print(f"  engines: {args.engines}")
-    print()
-
-    engines = load_engines(args.engines.split(","))
-    if not engines:
-        print("ERROR: no engines available; install at least one TTS engine", file=sys.stderr)
+    cfg_path = Path(args.config) if args.config else Path(
+        f"configs/examples/{args.project}/wake_phrases.yaml"
+    )
+    if not cfg_path.exists():
+        print(f"ERROR: {cfg_path} not found. Run scripts/init_wake.py first.", file=sys.stderr)
         return 1
+    cfg = yaml.safe_load(cfg_path.read_text())
+    out_root = Path(args.out) if args.out else Path(f"data/{args.project}/synth/positives")
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    jobs = plan_jobs(cfg, engines, args.count)
-    print(f"\nplanned {len(jobs)} jobs across {len(engines)} engines")
+    phrases = cfg["phrases"]
+    raw_total = sum(p["count"] for p in phrases)
+    if args.count is not None:
+        scale = args.count / raw_total
+    else:
+        scale = 1.0
+    per_phrase_count = {p["text"]: max(1, int(round(p["count"] * scale))) for p in phrases}
 
-    if args.dry_run:
-        print(json.dumps(jobs[:5], indent=2))
-        return 0
+    print(f"=== piper-sample-generator: positives for '{args.project}' ===", flush=True)
+    print(f"  config:   {cfg_path}")
+    print(f"  out:      {out_root}")
+    print(f"  total:    {sum(per_phrase_count.values())} ({len(phrases)} phrases)")
+    print(f"  speakers: {args.max_speakers}")
+    print(flush=True)
 
-    seen = load_manifest(out_dir)
-    sr = cfg["audio"]["sample_rate"]
-    t0 = time.time()
-    done = 0
-    for job in jobs:
-        fid = file_id(job["voice"], job["phrase"], job["speed"], job["emotion"], job["seed"])
-        if fid in seen:
-            continue
-        wav_path = out_dir / f"{fid}.wav"
-        engine = engines[job["engine"]]
-        ok = False
-        try:
-            ok = engine.synth(job["phrase"], job["voice"], job["speed"],
-                              job["emotion"], wav_path, sr)
-        except Exception as e:
-            print(f"  ✗ {fid}: {e}", file=sys.stderr)
-        if not ok or not wav_path.exists():
-            continue
-        row = {
-            "file_id": fid,
-            "wav_path": str(wav_path.relative_to(out_dir.parent.parent)),
-            "engine": job["engine"],
-            "voice": job["voice"],
-            "phrase": job["phrase"],
-            "speed": job["speed"],
-            "emotion": job["emotion"],
-            "seed": job["seed"],
-            "label": "positive",
-        }
-        append_manifest(out_dir, row)
-        done += 1
-        if done % 100 == 0:
-            elapsed = time.time() - t0
-            rate = done / max(elapsed, 1e-6)
-            remaining = (len(jobs) - len(seen) - done) / max(rate, 1e-6)
-            print(f"  [{done}/{len(jobs) - len(seen)}] {rate:.1f} samples/s, ~{remaining/60:.1f} min left")
+    psg_dir = ensure_psg(Path(args.psg_dir))
 
-    print(f"\ndone. {done} new samples, manifest at {out_dir}/manifest.jsonl")
+    by_phrase: dict[str, Path] = {}
+    for phrase, count in per_phrase_count.items():
+        phrase_dir = out_root / slug(phrase)
+        by_phrase[phrase] = phrase_dir
+        generate_for_phrase(psg_dir, phrase, phrase_dir, count,
+                            batch_size=args.batch_size,
+                            max_speakers=args.max_speakers)
+
+    write_manifest(out_root, by_phrase)
+
+    total = sum(len(list(d.glob("*.wav"))) for d in by_phrase.values())
+    print(f"\n=== done: {total} positive WAVs across {len(by_phrase)} phrases ===", flush=True)
     return 0
 
 

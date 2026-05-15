@@ -77,56 +77,32 @@ input WAV (16 kHz mono)
   → OpusCompression 8–24 kbps                (p=0.2)
   → Gain ±10 dB                              (p=1.0)
   → 40-mel spectrogram (60 ms win, 25 ms hop)
-  → 194-frame context window (microWakeWord default ≈ 5 s look-back)
-  → INT8 quantize (matching tflite-micro runtime expectations)
+  → 1.5 s window @ 10 ms hop → 150 frames × 40 mel features
+  → uint16 spectrogram (matches on-device audio_microfrontend output)
 ```
 
-Total effective training-set size: 10k × 5 = **50k positive features** + 2.5k × 5 = **12.5k hard-negative features** + ~300h × hop_rate ≈ **40M bulk-negative windows** (subsampled to ~500k per epoch to keep the positive:negative ratio in the 1:10 range).
+Per-sample replication: each positive is rendered into ~10 spectrogram windows via `SpectrogramGeneration(slide_frames=10, repetition=2)` for training; 1 window for val/test. Total effective training set: **~400k positive features** + **~25k hard-neg features** + ~9 GB of pre-computed bulk-negative mmap from upstream.
 
 ---
 
-## 5. Training config (microWakeWord)
+## 5. Training config (upstream microWakeWord)
 
-```yaml
-model:
-  architecture: micro_wake_word_inception
-  inception:
-    n_blocks: 3
-    filters: [16, 32, 32]
-    kernel_strides: [3, 3, 3]
-  features:
-    n_mels: 40
-    win_ms: 60
-    hop_ms: 25
-    n_frames: 194
+Lives at [`configs/examples/tofu/training_parameters.yaml`](configs/examples/tofu/training_parameters.yaml). Schema matches `microwakeword.model_train_eval.load_config()`.
 
-class_weights:
-  positive: 3.0
-  hard_negative: 2.0
-  bulk_negative: 1.0
-
-optimizer:
-  name: adam
-  learning_rate: 1e-3
-  schedule: cosine
-  warmup_steps: 500
-
-training:
-  batch_size: 256
-  epochs: 50
-  early_stop_metric: val_far_at_99_recall
-  early_stop_patience: 5
-
-quantization:
-  scheme: int8_ptq
-  representative_n: 1000
-  target: tflite_micro_esp32s3
-```
+Key choices for v0:
+- **Architecture**: MixedNet `pointwise_filters="64,64,64,64"`, `mixconv_kernel_sizes="[5],[7,11],[9,15],[23]"`, `stride=3` (same as the shipped Okay Nabu / Hey Jarvis models).
+- **Window**: `clip_duration_ms: 1500`, `window_step_ms: 10` (matches on-device ESPHome runtime).
+- **Features**: 40 mel-like channels via `pymicro-features.MicroFrontend` (C `audio_microfrontend` op) — bit-exact to what the device computes.
+- **Training**: `training_steps: [10000]`, `batch_size: 128`, `learning_rates: [0.001]`, `negative_class_weight: [20]`.
+- **Hard-neg penalty**: `penalty_weight: 5.0` on the Tofu hard-negatives mmap (vs default 1.0) — actively suppresses phonetic neighbors.
+- **Dinner-party boost**: `sampling_weight: 15.0`, `penalty_weight: 3.0` on CHiME6 dinner-party (vs default 10.0/1.0) — catches the "triggers on a podcast" failure mode.
+- **Best-checkpoint pick**: `maximization_metric: average_viable_recall`, `target_minimization: 0.5` FA/hr.
 
 Hardware budget on RunPod:
-- A40 48 GB SECURE ~$0.39/hr
-- Estimated wall: 1–2 h for 50 epochs (typically converges by epoch 20–25)
-- **Estimated cost per training run: $0.40–0.80**
+- RTX 4090 SECURE ~$0.69/hr (primary)
+- A40 SECURE ~$0.44/hr (fallback when 4090 unavailable)
+- Estimated training wall: 15–25 min for 10k steps. Full on-pod pipeline (synth + HF download + features + train + eval + manifest): 30–45 min.
+- **Estimated cost per training run: $0.40–0.55** on 4090 SECURE; **$0.25–0.35** on 4090 COMMUNITY (spot).
 
 ---
 

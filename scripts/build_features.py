@@ -1,245 +1,281 @@
 #!/usr/bin/env python3
-"""Convert synthetic + bulk audio into the TFRecord splits microWakeWord trains on.
+"""Convert positive + hard-negative WAVs into upstream-compatible RaggedMmap features.
 
-Generic over wake-word projects: pass `--project <slug>` and this script reads
-from `data/<slug>/synth/{positives,hard_negatives}/` and writes to
-`data/<slug>/clean/{train,val,test}.tfrecord`.
+Replaces my earlier from-scratch TFRecord builder. This version delegates
+to `microwakeword.audio.audio_utils.generate_features_for_clip` (the C
+`audio_microfrontend` op via pymicro-features) so the features are
+bit-exact with what the on-device ESPHome runtime expects.
 
-Pipeline per WAV:
-  1. Load, resample to 16 kHz mono.
-  2. Random crop to 1.5 s window.
-  3. Apply augmentation chain (scripts/augment.py:build_aug_chain).
-  4. Compute 40-bin log-mel features at 25 ms hop.
-  5. Quantize to INT8.
-  6. Write to TFRecord with label + project metadata.
+For positives (and hard-negatives), each WAV goes through:
+    1. `microwakeword.audio.augmentation.Augmentation` — RIR + background-noise
+       mixing using HF corpora (auto-downloaded if --download-aug-corpora).
+    2. `microwakeword.audio.spectrograms.SpectrogramGeneration` — produces
+       sliding spectrogram windows (slide_frames=10 for train, =1 for val/test).
+    3. `mmap_ninja.ragged.RaggedMmap.from_generator` — writes the spectrograms.
 
-Splits: 80/10/10 train/val/test. The test split is identifiable via
-`meta.json["test_ids"]` so you can audit any held-out sample by id.
+Output layout (matches upstream's FeatureHandler expectations):
+    data/<project>/features/
+        ├── training/wakeword_mmap/
+        ├── validation/wakeword_mmap/
+        └── testing/wakeword_mmap/
+    data/<project>/hard_negatives_features/
+        ├── training/wakeword_mmap/
+        ├── validation/wakeword_mmap/
+        └── testing/wakeword_mmap/
 
-Augmentation reps: each positive is replicated 5× with different realizations
-in train; 1× in val/test (no augmentation).
+Bulk negatives are already mmap'd by `download_hf_negatives.py` — this
+script does NOT process them.
+
+Usage:
+    python scripts/build_features.py --project tofu
+    python scripts/build_features.py --project tofu --download-aug-corpora
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import random
 import sys
 from pathlib import Path
 
-import numpy as np
-import yaml
 
-sys.path.insert(0, str(Path(__file__).parent))
-from augment import build_aug_chain, compute_log_mel  # noqa: E402
-
-
-def load_manifests(positives_dir: Path, hard_negs_dir: Path,
-                   bulk_dirs: list[Path]) -> list[dict]:
-    rows: list[dict] = []
-    for mfp in [positives_dir / "manifest.jsonl", hard_negs_dir / "manifest.jsonl"]:
-        if not mfp.exists():
-            continue
-        for line in mfp.read_text().splitlines():
-            if line.strip():
-                rows.append(json.loads(line))
-    for bd in bulk_dirs:
-        # Bulk corpora aren't strictly manifested per-WAV; use their corpus manifest.
-        for mfp in bd.rglob("manifest.jsonl"):
-            for line in mfp.read_text().splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                row["label"] = "bulk_negative"
-                row["wav_path"] = str(mfp.parent / row["path"])
-                rows.append(row)
-    return rows
-
-
-def assign_split(file_id: str, train: float, val: float) -> str:
-    """Deterministic hash split — same file_id always lands in same split."""
+def assign_split(file_id: str, train_p: float = 0.8, val_p: float = 0.1) -> str:
+    """Deterministic hash split — same file_id always lands in the same split."""
     h = int(hashlib.md5(file_id.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
-    if h < train:
-        return "train"
-    if h < train + val:
-        return "val"
-    return "test"
+    if h < train_p:
+        return "training"
+    if h < train_p + val_p:
+        return "validation"
+    return "testing"
 
 
-def load_audio(path: str, sample_rate: int):
-    import soundfile as sf
-    import librosa
-    audio, sr = sf.read(path, dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != sample_rate:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
-    return audio
+def load_manifest_paths(manifest_jsonl: Path) -> list[tuple[str, str]]:
+    """Return list of (file_id, wav_path) for each row in the manifest."""
+    out = []
+    if not manifest_jsonl.exists():
+        return out
+    for line in manifest_jsonl.read_text().splitlines():
+        if not line.strip():
+            continue
+        d = json.loads(line)
+        wav = d.get("wav_path")
+        fid = d.get("file_id") or Path(wav).stem
+        if wav and Path(wav).exists():
+            out.append((fid, wav))
+    return out
 
 
-def pad_or_crop(audio: np.ndarray, target_samples: int, rng: random.Random) -> np.ndarray:
-    if len(audio) > target_samples:
-        start = rng.randint(0, len(audio) - target_samples)
-        return audio[start:start + target_samples]
-    if len(audio) < target_samples:
-        pad = target_samples - len(audio)
-        left = rng.randint(0, pad)
-        return np.pad(audio, (left, pad - left), mode="constant")
-    return audio
+def maybe_download_aug_corpora(work_dir: Path) -> tuple[list[str], list[str]]:
+    """Download the RIR + background-noise corpora the canonical notebook uses.
+
+    Returns (impulse_paths, background_paths).
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    rir_dir = work_dir / "mit_rirs"
+    fma_dir = work_dir / "fma_16k"
+    as_dir = work_dir / "audioset_16k"
+
+    if not rir_dir.exists():
+        print(f"  downloading MIT IR survey → {rir_dir}", flush=True)
+        try:
+            from datasets import load_dataset
+            ds = load_dataset(
+                "davidscripka/MIT_environmental_impulse_responses",
+                split="train", streaming=True,
+            )
+            import soundfile as sf
+            rir_dir.mkdir(parents=True, exist_ok=True)
+            for i, ex in enumerate(ds):
+                if i >= 300:
+                    break
+                a = ex["audio"]
+                sf.write(str(rir_dir / f"rir_{i:05d}.wav"),
+                         a["array"], a["sampling_rate"])
+        except Exception as e:
+            print(f"  ⚠ RIR download failed: {e}", file=sys.stderr)
+
+    # FMA-XS music
+    if not fma_dir.exists():
+        print(f"  downloading FMA-xsmall → {fma_dir}", flush=True)
+        try:
+            import urllib.request
+            arc = work_dir / "fma_xs.zip"
+            if not arc.exists():
+                urllib.request.urlretrieve(
+                    "https://huggingface.co/datasets/mchl914/fma_xsmall/resolve/main/fma_xs.zip",
+                    arc,
+                )
+            import zipfile
+            with zipfile.ZipFile(arc) as z:
+                z.extractall(fma_dir)
+        except Exception as e:
+            print(f"  ⚠ FMA-XS download failed: {e}", file=sys.stderr)
+
+    # AudioSet shard
+    if not as_dir.exists():
+        print(f"  downloading AudioSet bal_train09 → {as_dir}", flush=True)
+        try:
+            from huggingface_hub import hf_hub_download
+            import tarfile
+            tar_path = Path(hf_hub_download(
+                repo_id="agkphysics/AudioSet",
+                filename="bal_train09.tar",
+                repo_type="dataset",
+            ))
+            with tarfile.open(tar_path) as tf:
+                tf.extractall(as_dir)
+        except Exception as e:
+            print(f"  ⚠ AudioSet download failed: {e}", file=sys.stderr)
+
+    impulse_paths = [str(rir_dir)] if rir_dir.exists() else []
+    background_paths = [str(p) for p in (fma_dir, as_dir) if p.exists()]
+    return impulse_paths, background_paths
 
 
-def make_writer(out_path: Path):
-    import tensorflow as tf
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    return tf.io.TFRecordWriter(str(out_path))
+def build_features_for_corpus(wavs: list[tuple[str, str]], out_root: Path,
+                              impulse_paths: list[str], background_paths: list[str],
+                              train_p: float = 0.8, val_p: float = 0.1) -> None:
+    """For each WAV, generate augmented spectrograms and write to RaggedMmap dirs.
 
+    Splits per-WAV deterministically by file_id hash; positive replication
+    (`slide_frames=10` for training, 1 for val/test) is handled by upstream's
+    SpectrogramGeneration.
+    """
+    from microwakeword.audio.augmentation import Augmentation
+    from microwakeword.audio.clips import Clips
+    from microwakeword.audio.spectrograms import SpectrogramGeneration
+    from mmap_ninja.ragged import RaggedMmap
 
-def write_example(writer, features: np.ndarray, label: int, project: str, file_id: str):
-    import tensorflow as tf
-    feat_bytes = features.tobytes()
-    ex = tf.train.Example(features=tf.train.Features(feature={
-        "features": tf.train.Feature(bytes_list=tf.train.BytesList(value=[feat_bytes])),
-        "shape": tf.train.Feature(int64_list=tf.train.Int64List(value=list(features.shape))),
-        "label": tf.train.Feature(int64_list=tf.train.Int64List(value=[label])),
-        "project": tf.train.Feature(bytes_list=tf.train.BytesList(value=[project.encode()])),
-        "file_id": tf.train.Feature(bytes_list=tf.train.BytesList(value=[file_id.encode()])),
-    }))
-    writer.write(ex.SerializeToString())
+    out_root.mkdir(parents=True, exist_ok=True)
+    by_split: dict[str, list[str]] = {"training": [], "validation": [], "testing": []}
+    for fid, path in wavs:
+        by_split[assign_split(fid, train_p, val_p)].append(path)
 
+    aug_probs = {
+        "SevenBandParametricEQ": 0.1, "TanhDistortion": 0.1,
+        "PitchShift": 0.1, "BandStopFilter": 0.1,
+        "AddColorNoise": 0.1, "AddBackgroundNoise": 0.75,
+        "Gain": 1.0, "RIR": 0.5,
+    }
+    augmenter = Augmentation(
+        augmentation_duration_s=3.2,
+        augmentation_probabilities=aug_probs,
+        impulse_paths=impulse_paths,
+        background_paths=background_paths,
+        background_min_snr_db=-5,
+        background_max_snr_db=10,
+        min_jitter_s=0.195,
+        max_jitter_s=0.205,
+    )
 
-LABEL_MAP = {"positive": 1, "hard_negative": 0, "bulk_negative": 0}
+    for split, paths in by_split.items():
+        if not paths:
+            continue
+        mmap_dir = out_root / split / "wakeword_mmap"
+        if mmap_dir.exists():
+            print(f"  ✓ {split}: {mmap_dir} already exists, skipping", flush=True)
+            continue
+        mmap_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write a tmp file list so Clips can glob it.
+        tmp_list = out_root / split / "_paths.txt"
+        tmp_list.parent.mkdir(parents=True, exist_ok=True)
+        tmp_list.write_text("\n".join(paths))
+
+        clips = Clips(input_directory="",
+                      file_pattern="",
+                      filepath_text_files=[str(tmp_list)])
+
+        slide_frames = 10 if split == "training" else 1
+        repetition = 2 if split == "training" else 1
+        specgen = SpectrogramGeneration(
+            clips=clips,
+            augmenter=augmenter,
+            step_ms=10,
+            slide_frames=slide_frames,
+        )
+
+        def _gen():
+            for _ in range(repetition):
+                yield from specgen.spectrogram_generator()
+
+        print(f"  building {split} → {mmap_dir} ({len(paths)} WAVs, x{repetition})",
+              flush=True)
+        RaggedMmap.from_generator(
+            out_dir=str(mmap_dir),
+            sample_generator=_gen(),
+            batch_size=100,
+        )
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--project", required=True, help="Wake-word project slug.")
-    ap.add_argument("--data-config", default="configs/data.yaml")
-    ap.add_argument("--rir-dir", default="data/raw/negatives/RIRS_NOISES")
-    ap.add_argument("--noise-dirs", default="data/raw/negatives/musan/noise,data/raw/negatives/demand")
-    ap.add_argument("--out", default=None,
-                    help="Output dir (default: data/<project>/clean)")
-    ap.add_argument("--bulk-dirs", default=None,
-                    help="Comma-separated bulk negative dirs (default: data/raw/negatives/{musan/speech,musan/music,librispeech,commonvoice,audioset})")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--max-bulk-windows-per-epoch", type=int, default=500000)
+    ap.add_argument("--project", required=True)
+    ap.add_argument("--positives-manifest", default=None,
+                    help="Default: data/<project>/synth/positives/manifest.jsonl")
+    ap.add_argument("--hard-negs-manifest", default=None,
+                    help="Default: data/<project>/synth/hard_negatives/manifest.jsonl")
+    ap.add_argument("--out-features", default=None,
+                    help="Default: data/<project>/features")
+    ap.add_argument("--out-hard-negs", default=None,
+                    help="Default: data/<project>/hard_negatives_features")
+    ap.add_argument("--aug-work-dir", default="data/aug_corpora",
+                    help="Where to cache RIR + noise + music corpora.")
+    ap.add_argument("--download-aug-corpora", action="store_true",
+                    help="Download MIT IR + FMA-XS + AudioSet shard if missing.")
+    ap.add_argument("--no-aug", action="store_true",
+                    help="Skip augmentation (faster for sanity tests; do NOT use for v0).")
+    ap.add_argument("--train", type=float, default=0.8)
+    ap.add_argument("--val", type=float, default=0.1)
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.data_config).read_text())
     project = args.project
-    out_dir = Path(args.out) if args.out else Path(f"data/{project}/clean")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(args.seed)
+    pos_mf = Path(args.positives_manifest) if args.positives_manifest else Path(
+        f"data/{project}/synth/positives/manifest.jsonl")
+    hn_mf = Path(args.hard_negs_manifest) if args.hard_negs_manifest else Path(
+        f"data/{project}/synth/hard_negatives/manifest.jsonl")
+    out_features = Path(args.out_features) if args.out_features else Path(
+        f"data/{project}/features")
+    out_hn = Path(args.out_hard_negs) if args.out_hard_negs else Path(
+        f"data/{project}/hard_negatives_features")
 
-    positives_dir = Path(f"data/{project}/synth/positives")
-    hard_negs_dir = Path(f"data/{project}/synth/hard_negatives")
-    bulk_default = ",".join([
-        "data/raw/negatives/musan/speech",
-        "data/raw/negatives/musan/music",
-        "data/raw/negatives/librispeech",
-        "data/raw/negatives/commonvoice",
-        "data/raw/negatives/audioset",
-    ])
-    bulk_dirs = [Path(d) for d in (args.bulk_dirs or bulk_default).split(",") if Path(d).exists()]
-    rir_dir = Path(args.rir_dir)
-    rir_paths = list(rir_dir.rglob("*.wav")) if rir_dir.exists() else []
-    noise_paths = []
-    for d in args.noise_dirs.split(","):
-        p = Path(d.strip())
-        if p.exists():
-            noise_paths.extend(p.rglob("*.wav"))
+    pos_wavs = load_manifest_paths(pos_mf)
+    hn_wavs = load_manifest_paths(hn_mf)
+    print(f"=== build features for '{project}' ===", flush=True)
+    print(f"  positives:    {len(pos_wavs)} WAVs from {pos_mf}")
+    print(f"  hard-negs:    {len(hn_wavs)} WAVs from {hn_mf}")
+    print(f"  out features: {out_features}")
+    print(f"  out hard-negs: {out_hn}")
+    print(flush=True)
 
-    print(f"=== build features for project '{project}' ===")
-    print(f"  positives:    {positives_dir}")
-    print(f"  hard-negs:    {hard_negs_dir}")
-    print(f"  bulk-negs:    {[str(d) for d in bulk_dirs]}")
-    print(f"  rirs:         {len(rir_paths)} files")
-    print(f"  noise:        {len(noise_paths)} files")
-    print(f"  out:          {out_dir}")
-    print()
-
-    sr = cfg["audio"]["sample_rate"]
-    target_samples = int(cfg["audio"]["window_s"] * sr)
-    feat_cfg = cfg["audio"]["features"]
-    split_cfg = cfg["split"]
-    reps_cfg = cfg["reps"]
-
-    rows = load_manifests(positives_dir, hard_negs_dir, bulk_dirs)
-    if not rows:
-        print(f"ERROR: no manifest rows found for project '{project}'", file=sys.stderr)
+    if not pos_wavs:
+        print(f"ERROR: no positive WAVs at {pos_mf}. Run synth_positives.py first.",
+              file=sys.stderr)
         return 1
 
-    # Build label-conditioned aug chains.
-    aug_chain_by_label = {
-        label: build_aug_chain(cfg["augment"], rir_paths, noise_paths, sr, label)
-        for label in ("positive", "hard_negative", "bulk_negative")
-    }
+    impulse_paths: list[str] = []
+    background_paths: list[str] = []
+    if not args.no_aug:
+        if args.download_aug_corpora:
+            impulse_paths, background_paths = maybe_download_aug_corpora(Path(args.aug_work_dir))
+        else:
+            work = Path(args.aug_work_dir)
+            if (work / "mit_rirs").exists():
+                impulse_paths = [str(work / "mit_rirs")]
+            for d in ("fma_16k", "audioset_16k"):
+                if (work / d).exists():
+                    background_paths.append(str(work / d))
+            if not impulse_paths or not background_paths:
+                print("WARN: augmentation corpora missing; pass --download-aug-corpora "
+                      "to fetch them. Proceeding with whatever's present.", file=sys.stderr)
 
-    writers = {split: make_writer(out_dir / f"{split}.tfrecord")
-               for split in ("train", "val", "test")}
-    counts = {split: 0 for split in ("train", "val", "test")}
-    test_ids = []
+    build_features_for_corpus(pos_wavs, out_features, impulse_paths, background_paths,
+                              train_p=args.train, val_p=args.val)
+    if hn_wavs:
+        build_features_for_corpus(hn_wavs, out_hn, impulse_paths, background_paths,
+                                  train_p=args.train, val_p=args.val)
 
-    for i, row in enumerate(rows):
-        if i % 500 == 0:
-            print(f"  [{i}/{len(rows)}] processed; counts={counts}")
-        label_str = row.get("label", "bulk_negative")
-        label = LABEL_MAP[label_str]
-        wav_path = row.get("wav_path") or row.get("path")
-        if not wav_path:
-            continue
-        # Project-aware paths: synth manifests use relative paths; bulk uses absolute.
-        if not Path(wav_path).is_absolute():
-            wav_path = str((positives_dir.parent.parent.parent / wav_path).resolve())
-        try:
-            audio = load_audio(wav_path, sr)
-        except Exception as e:
-            print(f"  ✗ {wav_path}: {e}", file=sys.stderr)
-            continue
-        file_id = row.get("file_id") or hashlib.md5(wav_path.encode()).hexdigest()[:12]
-        split = assign_split(file_id, split_cfg["train"], split_cfg["val"])
-        n_reps = reps_cfg.get(label_str, 1) if split == "train" else reps_cfg["val"]
-
-        if split == "test":
-            test_ids.append(file_id)
-
-        for rep in range(n_reps):
-            clip = pad_or_crop(audio, target_samples, rng)
-            if split == "train":
-                clip = aug_chain_by_label[label_str](samples=clip, sample_rate=sr)
-            mel = compute_log_mel(
-                clip, sr,
-                n_mels=feat_cfg["n_mels"],
-                win_ms=feat_cfg["win_ms"],
-                hop_ms=feat_cfg["hop_ms"],
-            )
-            # Pad/crop time axis to n_frames
-            t = mel.shape[1]
-            target_t = feat_cfg["n_frames"]
-            if t > target_t:
-                start = rng.randint(0, t - target_t)
-                mel = mel[:, start:start + target_t]
-            elif t < target_t:
-                mel = np.pad(mel, ((0, 0), (0, target_t - t)), mode="constant")
-            write_example(writers[split], mel.astype(np.float32),
-                          label, project, f"{file_id}_r{rep}")
-            counts[split] += 1
-
-    for w in writers.values():
-        w.close()
-
-    meta = {
-        "project": project,
-        "n_train": counts["train"],
-        "n_val": counts["val"],
-        "n_test": counts["test"],
-        "test_ids": test_ids,
-        "config": cfg,
-    }
-    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-
-    print(f"\ndone. {counts}")
-    print(f"meta: {out_dir}/meta.json")
+    print(f"\n=== done ===", flush=True)
     return 0
 
 

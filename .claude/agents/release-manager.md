@@ -31,7 +31,7 @@ python scripts/export_tflite.py \\
     --project <slug> \\
     --keras outputs/<slug>/model.keras \\
     --data data/<slug>/clean/train.tfrecord \\
-    --config configs/train.yaml \\
+    --config configs/examples/<slug>/training_parameters.yaml \\
     --out models/<slug>-wakeword-v0.tflite \\
     --emit-esphome configs/examples/<slug>/esphome.yaml \\
     --hf-repo-id <user>/<slug>-wakeword-v0 \\

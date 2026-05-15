@@ -1,22 +1,22 @@
 # REPLICATE — End-to-end reproduction
 
-Step-by-step. Mac M-series + a RunPod account. ~$1 of compute, ~4 days of wall time, mostly idle while CPU TTS and downloads run.
+Step-by-step replication for the Tofu wake-word. For any other slug, substitute `--project <slug>` and `configs/examples/<slug>/` paths.
+
+**Total cost**: ~$0.55–3 in RunPod credit. **Wall time**: ~3 h total, ~45 min active.
 
 ---
 
 ## 0. Prerequisites
 
-- macOS or Linux, Python 3.11
-- Homebrew (Mac) — `brew install python@3.11 git git-lfs ffmpeg sox`
-- RunPod account with $5+ credit and an API key
-- HuggingFace account + write token
-- GitHub PAT (only needed if cloning the repo onto a RunPod pod)
+- macOS or Linux, **Python 3.10** (microwakeword pins it)
+- Homebrew (Mac): `brew install python@3.10 git git-lfs ffmpeg sox`
+- RunPod account with **≥ $5 credit** and an API key
+- HuggingFace account + **write** token
+- GitHub PAT (for release; or omit and ship to HF only)
 
 ---
 
 ## 1. Credentials
-
-Create `~/.config/tofu-wake/` and drop four env files (chmod 600 each):
 
 ```bash
 mkdir -p ~/.config/tofu-wake && chmod 700 ~/.config/tofu-wake
@@ -31,13 +31,12 @@ cat > ~/.config/tofu-wake/gh.env << 'EOF'
 export GH_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 EOF
 cat > ~/.config/tofu-wake/together.env << 'EOF'
-export TOGETHER_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxx  # optional, only if using Together TTS
+export TOGETHER_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxx  # optional, for suggest_hard_negatives.py
 EOF
 chmod 600 ~/.config/tofu-wake/*.env
 ```
 
-Then any script can pull them with:
-
+Test:
 ```bash
 source scripts/load_creds.sh
 ```
@@ -47,182 +46,179 @@ source scripts/load_creds.sh
 ## 2. Local Python env
 
 ```bash
-git clone https://github.com/<you>/tofuWakeWord && cd tofuWakeWord
-python3 -m venv .venv && source .venv/bin/activate
+git clone https://github.com/temm1e-labs/customWakeWord && cd customWakeWord
+python3.10 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-(microWakeWord, audiomentations, Piper, etc.)
+This installs `microwakeword` from upstream (`OHF-Voice/micro-wake-word`), TensorFlow, `pymicro-features`, `mmap-ninja`, `audiomentations`, `piper-phonemize-cross`, and friends.
 
----
-
-## 3. Synthesize positives (~30 min on Mac M-series CPU)
-
+Validate:
 ```bash
-python scripts/synth_positives.py \
-    --phrases configs/wake_phrases.yaml \
-    --out data/synth/positives \
-    --count 10000
-```
-
-Watch `data/synth/positives/manifest.jsonl` grow. Each row: `{voice_id, phrase, speed, wav_path, duration_s}`. Stop early any time — the next step picks up wherever this leaves off.
-
-Sanity check:
-
-```bash
-wc -l data/synth/positives/manifest.jsonl   # should hit ~10000
-ls data/synth/positives/*.wav | head -5     # eyeball a few
-afplay data/synth/positives/$(ls data/synth/positives | grep wav | head -1)
+python -c "import microwakeword; print(microwakeword.__file__)"
 ```
 
 ---
 
-## 4. Synthesize hard negatives (~5 min)
+## 3. Confirm Tofu project is initialized
 
 ```bash
-python scripts/synth_hard_negatives.py \
-    --phrases configs/hard_negatives.yaml \
-    --out data/synth/hard_negatives \
-    --count 2500
+ls configs/examples/tofu/
+# wake_phrases.yaml  hard_negatives.yaml  training_parameters.yaml  README.md
+```
+
+To re-bootstrap from scratch:
+```bash
+python scripts/init_wake.py --name tofu \
+    --phrases "hey tofu,hi tofu,hello tofu,okay tofu" --force
+```
+
+Optional LLM-driven hard-neg extension:
+```bash
+source scripts/load_creds.sh
+python scripts/suggest_hard_negatives.py --name tofu  # ~$0.001
 ```
 
 ---
 
-## 5. Download bulk corpora (~30 GB, ~1 h)
+## 4. One-shot RunPod pipeline (recommended)
 
-```bash
-python scripts/collect_negatives.py \
-    --out data/raw/negatives \
-    --corpora musan,demand,commonvoice,audioset_subset,librispeech \
-    --hours 300
-```
-
-Outputs:
-- `data/raw/negatives/musan/`
-- `data/raw/negatives/demand/`
-- `data/raw/negatives/commonvoice/`
-- `data/raw/negatives/audioset/`
-- `data/raw/negatives/librispeech/`
-- `data/raw/negatives/rirs/`  (also pulls OpenSLR-28)
-- `data/raw/negatives/manifest.jsonl`
-
-If you're on slow internet, run this on a RunPod CPU-only pod and `rsync` the result back.
-
----
-
-## 6. Feature extraction + splits (~30 min on Mac)
-
-```bash
-python scripts/build_features.py \
-    --positives data/synth/positives \
-    --hard-negatives data/synth/hard_negatives \
-    --bulk-negatives data/raw/negatives \
-    --rir data/raw/negatives/rirs \
-    --noise "data/raw/negatives/musan/noise,data/raw/negatives/demand" \
-    --out data/clean \
-    --train-reps 5 \
-    --positive-oversample 3 \
-    --seed 42
-```
-
-Produces:
-- `data/clean/train.tfrecord`
-- `data/clean/val.tfrecord`
-- `data/clean/test.tfrecord`
-- `data/clean/meta.json`
-
-The split is deterministic on `--seed`; the test set is identified by `meta.json["test_ids"]` so you can audit any held-out sample by id.
-
----
-
-## 7. Hand-curate the eval set
-
-Inspect 50 random positives + 50 random hard-negs from the test split. Move any obvious failures (silent files, completely wrong transcripts) to `eval/tasks/`:
-
-```bash
-python scripts/seed_eval_tasks.py \
-    --from data/clean/test.tfrecord \
-    --positives 50 \
-    --hard-negatives 50 \
-    --bulk-stream-minutes 60 \
-    --out eval/tasks
-```
-
-This is the **only manual step** in the pipeline. Plan for 30 min of listening.
-
----
-
-## 8. Train on RunPod (~$0.40–0.80, ~1–2 h)
+This runs every stage on the pod: synth → bulk download → features → train → eval → manifest → HF upload.
 
 ```bash
 source scripts/load_creds.sh
-python scripts/runpod_train.py
+python scripts/runpod_train.py --project tofu \
+    --hf-repo-id <your_username>/tofu-wakeword-v0
 ```
 
-The launcher prints:
-- `pod_id`
-- API proxy URL on `:8000` (used by eval if you want to score against the float model before quant)
-- Log server URL on `:8001/setup.log` — tail this anytime
+The launcher prints `pod_id` + log URL on `:8001/setup.log`. Wall time: 30–45 min. Cost: ~$0.50 on 4090 SECURE.
 
-It auto-detects when training + INT8 export finishes and stops the pod. If anything goes wrong, the pod stays alive long enough for you to inspect `setup.log` (capped at MAX_WAIT_S = 4 h to avoid runaway costs).
+Tail the log mid-run:
+```bash
+curl -s https://<pod_id>-8001.proxy.runpod.net/setup.log | tail -50
+```
 
-The merged `.tflite` is uploaded back to your HuggingFace repo (configured in `configs/train.yaml:hub_model_id`).
+Wait for `/_done` marker:
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://<pod_id>-8001.proxy.runpod.net/_done
+# 200 = done, 404 = still running
+```
 
 ---
 
-## 9. Eval
+## 4-alt. Run stages manually (debugging or offline)
+
+If you want to inspect each step or you don't have a RunPod account yet:
+
+### 4a. Synth positives (Mac MPS ~30-60 min; pod 4090 ~5 min)
 
 ```bash
-python -m eval.runner \
+python scripts/synth_positives.py --project tofu
+```
+
+Watch `data/tofu/synth/positives/manifest.jsonl` grow. Resumable: re-run picks up where it left off.
+
+### 4b. Synth hard-negs
+
+```bash
+python scripts/synth_hard_negatives.py --project tofu
+```
+
+### 4c. Download upstream HF negatives (~9 GB, ~3 min on a fast pipe)
+
+```bash
+python scripts/download_hf_negatives.py --out data/negative_datasets
+```
+
+### 4d. Feature extraction
+
+```bash
+python scripts/build_features.py --project tofu --download-aug-corpora
+```
+
+### 4e. Train + INT8 export
+
+```bash
+python scripts/train_microwakeword.py --project tofu \
+    --training-config configs/examples/tofu/training_parameters.yaml
+```
+
+Output:
+- `trained_models/tofu/tflite_stream_state_internal_quant/stream_state_internal_quant.tflite`
+- `models/tofu-wakeword-v0.tflite` (copied)
+- operating-point table printed to stdout
+
+---
+
+## 5. Eval against held-out tasks
+
+```bash
+python scripts/seed_eval_tasks.py --project tofu  # optional; samples from training manifest
+python -m eval.runner --project tofu \
     --model models/tofu-wakeword-v0.tflite \
-    --tasks eval/tasks \
+    --threshold 0.85 \
     --out eval/results/tofu-v0__$(date +%s).json
 ```
 
-Outputs per-task results + summary metrics: FRR, FAR/hour, per-hard-neg-bucket FAR, ROC across detection thresholds.
+Output:
+- FRR on positives
+- FAR/hr on bulk
+- per-hard-neg-bucket FAR
+- ROC across detection thresholds
 
-If the metrics miss the targets in [`PLAN.md`](PLAN.md) §6, the per-bucket breakdown points to the failure mode:
-- High FRR + low FAR → more positive diversity (add accents, emotions, speeds)
-- Low FRR + high FAR on a specific hard-neg bucket → add more of that bucket
-- Both bad → augmentation is too aggressive, or representative dataset for INT8 quant was bad → check `data/clean/meta.json` for the representative samples
+If FRR > 5% or FAR/hr > 1.0, see iteration playbook in [`TRAINING_PLAN.md`](TRAINING_PLAN.md) §7.
 
 ---
 
-## 10. Publish
+## 6. Emit ESPHome manifest
 
 ```bash
-python scripts/upload_to_hf.py \
+python scripts/emit_manifest.py --project tofu --threshold 0.85
+# writes configs/examples/tofu/manifest.json
+```
+
+If you let `--threshold` default and have an eval JSON, it auto-picks the operating point.
+
+---
+
+## 7. Publish to HuggingFace
+
+```bash
+python scripts/upload_to_hf.py --project tofu \
     --model models/tofu-wakeword-v0.tflite \
     --repo-id <your_username>/tofu-wakeword-v0 \
     --eval-json eval/results/tofu-v0__<latest>.json \
-    --esphome configs/esphome_tofu.yaml
+    --esphome configs/examples/tofu/manifest.json
 ```
 
-Then on GitHub:
+Pushes: `tofu-wakeword-v0.tflite`, `manifest.json`, `eval_results.json`, `README.md` (auto-generated model card).
+
+---
+
+## 8. GitHub release
 
 ```bash
 gh release create v0.1.0 \
     models/tofu-wakeword-v0.tflite \
-    configs/esphome_tofu.yaml \
+    configs/examples/tofu/manifest.json \
     eval/results/tofu-v0__<latest>.json \
     --title "tofuWakeWord v0.1.0" \
-    --notes "First trained Tofu wake-word. FRR=X.X% FAR=Y.Y/hr. See model card."
+    --notes "FRR=X.X% FAR=Y.Y/hr. See model card on HF."
 ```
 
 ---
 
-## 11. Flash to ESP32-S3
+## 9. Flash to ESP32-S3
 
-(Outside this repo — but here's the minimal ESPHome config you need.)
+Minimal ESPHome config for an ESP32-S3-DevKitC-1 + INMP441 I2S mic:
 
-`tofu.yaml`:
 ```yaml
 esphome:
   name: tofu
 esp32:
   board: esp32-s3-devkitc-1
-  framework:
-    type: esp-idf
+  framework: { type: esp-idf }
 
 i2s_audio:
   i2s_lrclk_pin: GPIO5
@@ -238,7 +234,7 @@ micro_wake_word:
   microphone: tofu_mic
   vad:
   models:
-    - model: hey_tofu
+    - model: tofu
       probability_cutoff: 0.85
       sliding_window_size: 5
       url: https://huggingface.co/<your_username>/tofu-wakeword-v0/resolve/main/tofu-wakeword-v0.tflite
@@ -252,20 +248,27 @@ micro_wake_word:
 esphome run tofu.yaml
 ```
 
-Say "hey tofu" near the mic. The log should fire. If it doesn't, lower `probability_cutoff` and re-flash.
+Say "hey tofu" near the mic. The ESPHome log fires. If it doesn't, lower `probability_cutoff` and re-flash. If it triggers too often, raise it.
 
 ---
 
-## 12. With Claude Code
+## 10. With Claude Code
 
-Each step above is also a slash command in `.claude/commands/`. The agentic flow:
+Each step above is also a slash command:
 
 ```
-/tofu-status        # see where the pipeline is
-/tofu-synth         # steps 3–5 (synthesis + bulk download)
-/tofu-train         # steps 6–8 (feature build + RunPod train)
-/tofu-eval          # step 9
-/tofu-release       # step 10
+/wake-status                                # see pipeline state
+/wake-new <slug> "<phrases>"                # bootstrap a new wake word
+/wake-synth <slug>                          # steps 4a-c
+/wake-train <slug> --hf-repo-id <user/repo> # steps 4d-7 (auto-uploads if --hf-repo-id given)
+/wake-eval <slug>                           # step 5
+/wake-release <slug>                        # steps 6-8
 ```
 
-The agents handle credential sourcing, polling RunPod via ScheduleWakeup, generating the model card from the eval JSON, etc. See [`CLAUDE.md`](CLAUDE.md) for the agent contract.
+See [`CLAUDE.md`](CLAUDE.md) for the agent contract.
+
+---
+
+## Pre-flight checklist
+
+Before running step 4, walk [`READY_TO_TRAIN.md`](READY_TO_TRAIN.md). Most failures (Python 3.11 mismatch, missing tokens, RunPod credit absent) are caught there.

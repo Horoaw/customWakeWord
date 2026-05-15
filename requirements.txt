@@ -1,41 +1,39 @@
-# Core ML — TensorFlow for microWakeWord training
-tensorflow>=2.15,<2.18
-keras>=3.0
-microwakeword @ git+https://github.com/kahrendt/microWakeWord.git
-tflite-runtime>=2.14  # for local eval; on RunPod we use the full TF
+# Upstream microWakeWord — the canonical training framework.
+# Pins TensorFlow 2.16+, requires Python 3.10.
+microwakeword @ git+https://github.com/OHF-Voice/micro-wake-word.git
 
-# TTS engines
-piper-tts>=1.2  # if pip install fails on Mac, fall back to the precompiled binary
-kokoro>=0.1     # Kokoro-82M python wrapper (huggingface)
-# MeloTTS — install separately via `pip install git+https://github.com/myshell-ai/MeloTTS.git`
-# Parler-TTS — `pip install git+https://github.com/huggingface/parler-tts.git`
+# Pinned by microwakeword itself, but listed here so `pip install -r` on a
+# bare environment doesn't try to resolve a wildcard:
+tensorflow>=2.16
+ai-edge-litert            # tflite runtime (for inference + eval)
+pymicro-features          # C audio_microfrontend op (must match runtime)
+mmap-ninja                # RaggedMmap feature store used by upstream
+audiomentations>=0.36     # CPU augmentation (RIR, noise, EQ, codec)
+webrtcvad-wheels          # VAD silence removal in piper-sample-generator path
 
-# Audio
-librosa>=0.10
-soundfile>=0.12
-audiomentations>=0.36
-torch-audiomentations>=0.11
-pyroomacoustics>=0.7
-ffmpeg-python>=0.2
-
-# Datasets / downloaders
-datasets>=3.0
-requests>=2.31
-tqdm>=4.66
+# piper-sample-generator deps (cloned at runtime; these are its Python deps)
+torch>=2.2
+torchaudio>=2.2
+piper-phonemize-cross==1.2.1
 
 # Eval + utilities
+librosa>=0.10
+soundfile>=0.12
 numpy>=1.26,<2.0
 scipy>=1.11
-pandas>=2.1
 pyyaml>=6.0
 jsonlines>=4.0
 rich>=13.7
 
-# API clients
+# Datasets / downloaders
+datasets>=3.0
 huggingface_hub>=0.24
+requests>=2.31
+tqdm>=4.66
+
+# API clients
 runpod>=1.7
-openai>=1.40  # if we plug into a hosted TTS API later
-together>=1.4  # optional, only if using Together-hosted models for anything
+openai>=1.40             # for scripts/suggest_hard_negatives.py (Together / OpenAI)
 
 # Dev
 pytest>=8.0

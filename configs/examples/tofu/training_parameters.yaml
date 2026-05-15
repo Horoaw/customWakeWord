@@ -1,0 +1,103 @@
+# Upstream microWakeWord training config for the Tofu wake-word v0.
+#
+# Consumed by `microwakeword.model_train_eval.load_config(...)` via our
+# `scripts/train_microwakeword.py` wrapper. Schema follows the canonical
+# notebook at https://github.com/OHF-Voice/micro-wake-word/blob/main/notebooks/basic_training_notebook.ipynb
+#
+# `train_dir` is overwritten by the wrapper at runtime to point at
+# `trained_models/<project>/`.
+
+train_dir: trained_models/tofu
+
+# Feature window step in ms — must match what scripts/build_features.py
+# passes to microwakeword.audio.spectrograms.SpectrogramGeneration.
+window_step_ms: 10
+
+# Wake-detection decision window — keep at 1500 ms (everyone does).
+clip_duration_ms: 1500
+
+# Each `features` entry is a corpus the trainer samples from per batch.
+#   sampling_weight: relative chance of being sampled into a batch
+#   penalty_weight:  multiplier on loss for misclassifications on this corpus
+#   truth:           true for positives, false for negatives
+#   truncation_strategy:
+#     "truncate_start"  — wake-word at end of window (positives)
+#     "random"          — random crop (negatives, music)
+#     "split"           — split long ambient clip into non-overlapping windows (eval)
+features:
+  # 1. Tofu positives
+  - features_dir: data/tofu/features
+    sampling_weight: 2.0
+    penalty_weight: 1.0
+    truth: true
+    truncation_strategy: truncate_start
+    type: mmap
+
+  # 2. Tofu hard negatives — penalty 5x per malonestar's successful pattern.
+  #    Actively trains the model to suppress phonetic neighbors.
+  - features_dir: data/tofu/hard_negatives_features
+    sampling_weight: 3.0
+    penalty_weight: 5.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 3. LibriSpeech + VOiCES speech (~300 h)
+  - features_dir: data/negative_datasets/speech
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 4. CHiME6 dinner-party (real multi-talker, conversational TV-like)
+  #    Boosted 15.0/3.0 vs upstream default 10.0/1.0 — this is the corpus
+  #    that catches the "model triggers on a podcast" failure mode.
+  - features_dir: data/negative_datasets/dinner_party
+    sampling_weight: 15.0
+    penalty_weight: 3.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 5. FMA music + FSD50K noise + WHAM (no speech)
+  - features_dir: data/negative_datasets/no_speech
+    sampling_weight: 5.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 6. CHiME6 dev/eval — sampling_weight=0 means it's only used at val/test.
+  - features_dir: data/negative_datasets/dinner_party_eval
+    sampling_weight: 0.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: split
+    type: mmap
+
+# Single-phase training. 10k steps @ batch 128 → ~3 min on a 4090.
+# v0 strategy: ship a baseline first, iterate to two-phase only if metrics demand it.
+training_steps: [10000]
+positive_class_weight: [1]
+negative_class_weight: [20]
+learning_rates: [0.001]
+
+batch_size: 128
+
+# No SpecAugment on the spectrograms — the input-side audiomentations chain
+# already provides enough variability. SpecAugment can be re-enabled in v1
+# if recall plateaus.
+time_mask_max_size: [0]
+time_mask_count: [0]
+freq_mask_max_size: [0]
+freq_mask_count: [0]
+
+eval_step_interval: 500
+
+# Pick the best checkpoint by maximizing recall subject to a false-alarm budget.
+# `average_viable_recall` averages recall across all checkpoint cutoffs where
+# FA/hr ≤ target_minimization.
+target_minimization: 0.5
+minimization_metric: null
+maximization_metric: average_viable_recall

@@ -1,69 +1,87 @@
 ---
 name: data-synthesizer
-description: Synthesize TTS positives + hard-negatives and collect bulk negative corpora for a wake-word project. Use when the user says "/wake-synth <slug>" or asks to "generate data" / "run synthesis" for a wake-word project.
+description: Synthesize TTS positives + hard-negatives and pull bulk negatives for a wake-word project. Use when the user says "/wake-synth <slug>" or asks to "generate data" / "run synthesis".
 ---
 
-You produce the training audio for a wake-word project.
+You produce the training audio for a wake-word project. The canonical recipe
+uses **piper-sample-generator** (904 LibriTTS-R speakers) for positives +
+hard-negatives, and the **pre-built RaggedMmap negatives** from HuggingFace
+(`kahrendt/microwakeword`) for bulk audio.
 
 ## Inputs
 
 - Project slug (`<slug>`).
-- Optional flags: `--count <n>` for positives, `--negatives-only`, `--skip-bulk`.
+- Optional flags:
+  - `--count <n>`: override total positive count (default reads YAML).
+  - `--negatives-only`, `--skip-bulk`: stage selectors.
 
 ## Contract
 
-Read `configs/examples/<slug>/wake_phrases.yaml` and `configs/examples/<slug>/hard_negatives.yaml`. They must exist; if not, dispatch to `wake-bootstrapper` first.
+Read `configs/examples/<slug>/wake_phrases.yaml` and
+`configs/examples/<slug>/hard_negatives.yaml`. They must exist; if not,
+dispatch to `wake-bootstrapper` first.
 
-Run the three synthesis stages in order:
-
-### 1. Positives
-
-```bash
-python scripts/synth_positives.py \\
-    --phrases configs/examples/<slug>/wake_phrases.yaml \\
-    --out data/<slug>/synth/positives \\
-    --count 10000
-```
-
-This is CPU-bound on Mac (~30 min for 10k samples across 4 engines). The script is resumable — if `manifest.jsonl` exists, it picks up where it stopped.
-
-### 2. Hard negatives
+### 1. Positives — `synth_positives.py`
 
 ```bash
-python scripts/synth_hard_negatives.py \\
-    --phrases configs/examples/<slug>/hard_negatives.yaml \\
-    --out data/<slug>/synth/hard_negatives \\
-    --count 2500
+python scripts/synth_positives.py --project <slug>
 ```
 
-### 3. Bulk negatives
+The script auto-clones `piper-sample-generator` (the kahrendt MPS-support
+fork on Darwin, the rhasspy main on Linux) and downloads the
+`en_US-libritts_r-medium.pt` generator model on first run. CPU on Mac:
+~30-60 min for 20k samples; on a RunPod 4090: 3-5 min.
 
-Only run this if `data/raw/negatives/musan/manifest.jsonl` does NOT exist — the bulk corpora are shared across all projects.
+### 2. Hard negatives — `synth_hard_negatives.py`
 
 ```bash
-python scripts/collect_negatives.py \\
-    --out data/raw/negatives \\
-    --corpora musan,rirs,librispeech,demand
+python scripts/synth_hard_negatives.py --project <slug>
 ```
 
-Common Voice and AudioSet are gated behind their own flags (`--corpora ...,commonvoice,audioset_subset`) — only fetch them if the user explicitly asks.
+Same engine, iterates over each bucket × phrase in `hard_negatives.yaml`.
+Output is tagged with `bucket_id` in the manifest so eval can report
+per-bucket FAR.
+
+### 3. Bulk negatives — `download_hf_negatives.py`
+
+Only run if `data/negative_datasets/speech` is missing (the bulk corpora
+are shared across projects, ~9 GB).
+
+```bash
+python scripts/download_hf_negatives.py --out data/negative_datasets
+```
+
+Pulls 7 zips: `speech`, `speech_background`, `dinner_party`,
+`dinner_party_background`, `dinner_party_eval`, `no_speech`,
+`no_speech_background`. Already in RaggedMmap format — no further
+feature extraction needed for the negatives.
+
+License note: CC-BY-NC-4.0 (non-commercial). For commercial deployment
+substitute with MUSAN + Common Voice + AudioSet via
+`scripts/collect_negatives.py` (legacy multi-corpus path).
 
 ## Polling + interruption
 
-These are local CPU jobs. Run them in the foreground; print progress every minute. If the user stops you, the manifests are durable — restart the same command later and it resumes.
+These are CPU/network-bound. Run in the foreground; print progress every
+minute. If interrupted, the manifests + zip files are durable — restart
+the same command later and it resumes.
 
 ## After done
 
 Print a one-paragraph summary:
-- N positives, M hard-negs, X hours of bulk audio
-- Total disk used under `data/<slug>/` and `data/raw/negatives/`
+- N positive WAVs, M hard-neg WAVs, X GB of bulk audio
+- Total disk used under `data/<slug>/` and `data/negative_datasets/`
 - Next step: `/wake-train <slug>`
 
 ## Failure modes
 
-- **TTS engine missing**: degrade gracefully. If only Piper is installed, that's fine for v0 — note it and continue.
+- **piper-sample-generator clone fails silently** (upstream issue #94): assert
+  the directory exists after cloning; if not, print git stderr.
+- **HF download fails on commonvoice/audioset**: those are gated behind
+  optional flags in `scripts/collect_negatives.py`; the canonical recipe
+  doesn't need them. Skip and continue.
 - **Disk full**: bail; show `df -h` and ask the user to free space.
-- **Corpus download fails**: keep what you got, skip the rest, report which corpora are usable.
+  ~10-15 GB total disk needed for v0.
 
 ## Tone
 
