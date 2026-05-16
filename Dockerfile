@@ -44,12 +44,19 @@ RUN /opt/venv/bin/pip install --upgrade pip wheel
 COPY requirements.txt /tmp/requirements.txt
 RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Pre-clone piper-sample-generator — saves another 30s on the pod.
-RUN git clone --depth 1 https://github.com/rhasspy/piper-sample-generator.git \
+# Pre-clone piper-sample-generator at v2.0.0 — saves another 30s on the pod.
+# PIN: v2.0.0 is the last release with the old `generate_samples.py` at the
+# repo root. v3.x reorganized into the `piper_sample_generator` package +
+# `python -m piper_sample_generator` invocation, and dropped the implicit
+# model resolution that our synth scripts rely on (they don't pass --model).
+# Stay on v2.0.0 until scripts/synth_*.py migrates to the new API.
+RUN git clone --depth 1 --branch v2.0.0 \
+        https://github.com/rhasspy/piper-sample-generator.git \
         /opt/piper-sample-generator \
     && mkdir -p /opt/piper-sample-generator/models \
     && wget -q -O /opt/piper-sample-generator/models/en_US-libritts_r-medium.pt \
-        https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt
+        https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt \
+    && test -f /opt/piper-sample-generator/generate_samples.py
 
 # Sanity check — fail the build if any critical import breaks
 RUN /opt/venv/bin/python -c "import tensorflow as tf; print('tf', tf.__version__)" \
