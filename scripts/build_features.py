@@ -177,14 +177,21 @@ def build_features_for_corpus(wavs: list[tuple[str, str]], out_root: Path,
             continue
         mmap_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write a tmp file list so Clips can glob it.
-        tmp_list = out_root / split / "_paths.txt"
-        tmp_list.parent.mkdir(parents=True, exist_ok=True)
-        tmp_list.write_text("\n".join(paths))
+        # Stage WAVs into a flat directory of symlinks so Clips can find
+        # them via glob. Upstream microwakeword dropped the
+        # `filepath_text_files=[...]` kwarg in favour of
+        # `input_directory + file_pattern` only — symlinks let us keep
+        # the original storage layout (per-phrase subdirs) while
+        # presenting a flat view to Clips without copying WAV bytes.
+        symlink_dir = out_root / split / "_clips"
+        symlink_dir.mkdir(parents=True, exist_ok=True)
+        for old in symlink_dir.glob("*.wav"):
+            old.unlink()
+        for i, p in enumerate(paths):
+            link = symlink_dir / f"{i:07d}.wav"
+            link.symlink_to(p)
 
-        clips = Clips(input_directory="",
-                      file_pattern="",
-                      filepath_text_files=[str(tmp_list)])
+        clips = Clips(input_directory=str(symlink_dir), file_pattern="*.wav")
 
         slide_frames = 10 if split == "training" else 1
         repetition = 2 if split == "training" else 1
