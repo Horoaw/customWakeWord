@@ -308,11 +308,13 @@ def wait_for_done(pod_id: str) -> bool:
             last_log_dump = elapsed
 
         # Observed: a healthy host boots within 3-4 min on a cached image. Lower
-        # hosts (≤41GB mem on 4090) repeatedly hang at uptime=0. Trip the STUCK
-        # detector at 7 min so retry_launch.sh can cycle to the next pool faster.
-        # ~$0.08 wasted per stuck attempt at 4090 rates.
-        if elapsed >= 7 * 60 and runtime_obj is None:
-            raise RuntimeError("STUCK: pod runtime null after 7 min — likely bad host; retry")
+        # hosts (≤41GB mem on 4090) repeatedly hang at uptime=0. With the
+        # pre-baked GHCR image (~5 GB pulled via auth from GHCR) the first
+        # boot on a host without a cached image can take 8-12 min just to
+        # pull. Bumped to 14 min to absorb a one-time cold pull on the host;
+        # ~$0.32 wasted per stuck attempt at A100 rates worst case.
+        if elapsed >= 14 * 60 and runtime_obj is None:
+            raise RuntimeError("STUCK: pod runtime null after 14 min — likely bad host or pull failing; retry")
 
         time.sleep(60)
     return False
