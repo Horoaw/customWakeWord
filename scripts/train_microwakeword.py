@@ -36,16 +36,23 @@ import yaml
 
 # Default MixedNet architecture flags (canonical recipe from the upstream notebook).
 # These match the model that ships as Okay Nabu / Hey Jarvis / Alexa in ESPHome.
-# NOTE: `stride` MUST be int — upstream's load_config does an integer division
-# on it. The string-form flags (e.g., "64,64,64,64") get split/parsed downstream
-# by model_module.model_parameters; stride does not.
+# Type rules (from reading upstream `microwakeword/mixednet.py`):
+#   - String, parsed via `parse(...)`: pointwise_filters, repeat_in_block,
+#     mixconv_kernel_sizes, residual_connection. These hold comma-separated
+#     lists / bracketed sublists; the parser splits the string.
+#   - Int, used directly in arithmetic: first_conv_filters (compared to 0,
+#     used as conv filter count), first_conv_kernel_size (subtracted from
+#     int, used in kernel shape tuple), stride (used in integer division
+#     by load_config, used in strides tuple).
+# Mixing the two breaks at TypeError boundaries that are not always reached
+# during quick sanity tests.
 DEFAULT_MIXEDNET_FLAGS = {
     "pointwise_filters": "64,64,64,64",
     "repeat_in_block": "1,1,1,1",
     "mixconv_kernel_sizes": "[5],[7,11],[9,15],[23]",
     "residual_connection": "0,0,0,0",
-    "first_conv_filters": "32",
-    "first_conv_kernel_size": "5",
+    "first_conv_filters": 32,
+    "first_conv_kernel_size": 5,
     "stride": 3,
 }
 
