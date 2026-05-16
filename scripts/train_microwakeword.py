@@ -36,6 +36,9 @@ import yaml
 
 # Default MixedNet architecture flags (canonical recipe from the upstream notebook).
 # These match the model that ships as Okay Nabu / Hey Jarvis / Alexa in ESPHome.
+# NOTE: `stride` MUST be int — upstream's load_config does an integer division
+# on it. The string-form flags (e.g., "64,64,64,64") get split/parsed downstream
+# by model_module.model_parameters; stride does not.
 DEFAULT_MIXEDNET_FLAGS = {
     "pointwise_filters": "64,64,64,64",
     "repeat_in_block": "1,1,1,1",
@@ -43,7 +46,7 @@ DEFAULT_MIXEDNET_FLAGS = {
     "residual_connection": "0,0,0,0",
     "first_conv_filters": "32",
     "first_conv_kernel_size": "5",
-    "stride": "3",
+    "stride": 3,
 }
 
 
