@@ -44,6 +44,24 @@ RUN /opt/venv/bin/pip install --upgrade pip wheel
 COPY requirements.txt /tmp/requirements.txt
 RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
+# Install microwakeword editably from a local clone with patched __init__.py
+# files. Upstream OHF-Voice/micro-wake-word's setup.py uses
+# `find_packages()`, but the `audio/` and `layers/` subdirectories ship
+# without __init__.py — so a normal install drops them entirely and
+# `from microwakeword.audio.augmentation import Augmentation` errors
+# with ModuleNotFoundError. We patch them in before the editable install,
+# then sanity-check the import works.
+RUN git clone --depth 1 https://github.com/OHF-Voice/micro-wake-word.git \
+        /opt/microwakeword \
+    && touch /opt/microwakeword/microwakeword/audio/__init__.py \
+    && touch /opt/microwakeword/microwakeword/layers/__init__.py \
+    && /opt/venv/bin/pip install --no-cache-dir -e /opt/microwakeword \
+    && /opt/venv/bin/python -c \
+        "from microwakeword.audio.augmentation import Augmentation; \
+         from microwakeword.audio.clips import Clips; \
+         from microwakeword.audio.spectrograms import SpectrogramGeneration; \
+         print('microwakeword.audio OK')"
+
 # Pre-clone piper-sample-generator at v2.0.0 — saves another 30s on the pod.
 # PIN: v2.0.0 is the last release with the old `generate_samples.py` at the
 # repo root. v3.x reorganized into the `piper_sample_generator` package +

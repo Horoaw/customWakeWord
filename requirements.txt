@@ -1,6 +1,11 @@
 # Upstream microWakeWord — the canonical training framework.
 # Pins TensorFlow 2.16+, requires Python 3.10.
-microwakeword @ git+https://github.com/OHF-Voice/micro-wake-word.git
+#
+# NOTE: installed via `pip install -e /opt/microwakeword` in the Dockerfile,
+# not from PyPI. Upstream's setup.py uses find_packages() but the audio/
+# and layers/ subdirs ship without __init__.py, so a normal install drops
+# `microwakeword.audio.augmentation` (which our build_features.py needs).
+# The Dockerfile creates those __init__.py files before the editable install.
 
 # Pinned by microwakeword itself, but listed here so `pip install -r` on a
 # bare environment doesn't try to resolve a wildcard:
@@ -37,7 +42,11 @@ jsonlines>=4.0
 rich>=13.7
 
 # Datasets / downloaders
-datasets>=3.0
+# Pin datasets<4: 4.x switched audio decoding from soundfile to torchcodec,
+# breaks streaming download of MIT_environmental_impulse_responses with
+# "To support encoding audio data, please install 'torchcodec'." Sticking
+# with 3.x avoids the new dep entirely.
+datasets>=3.0,<4.0
 huggingface_hub>=0.24
 requests>=2.31
 tqdm>=4.66
