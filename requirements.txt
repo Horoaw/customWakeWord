@@ -63,3 +63,9 @@ openai>=1.40             # for scripts/suggest_hard_negatives.py (Together / Ope
 # Dev
 pytest>=8.0
 ruff>=0.6
+
+# Training-loop dep: upstream microwakeword's train.py calls
+# tf.summary.scalar(...) which raises TBNotInstalledError without
+# tensorboard. We don't actually use the TB UI; it's a hard dep
+# of the upstream training loop.
+tensorboard>=2.16
