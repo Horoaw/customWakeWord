@@ -36,16 +36,18 @@ import yaml
 
 # Default MixedNet architecture flags (canonical recipe from the upstream notebook).
 # These match the model that ships as Okay Nabu / Hey Jarvis / Alexa in ESPHome.
-# Type rules (from reading upstream `microwakeword/mixednet.py`):
+# Full attribute set required by upstream `microwakeword/mixednet.py`. Missing
+# any of these raises `AttributeError: 'Namespace' object has no attribute ...`
+# deep inside model construction.
+# Type rules:
 #   - String, parsed via `parse(...)`: pointwise_filters, repeat_in_block,
 #     mixconv_kernel_sizes, residual_connection. These hold comma-separated
 #     lists / bracketed sublists; the parser splits the string.
-#   - Int, used directly in arithmetic: first_conv_filters (compared to 0,
-#     used as conv filter count), first_conv_kernel_size (subtracted from
-#     int, used in kernel shape tuple), stride (used in integer division
-#     by load_config, used in strides tuple).
-# Mixing the two breaks at TypeError boundaries that are not always reached
-# during quick sanity tests.
+#   - Int, used directly in arithmetic: first_conv_filters (compared to 0),
+#     first_conv_kernel_size (kernel-shape int), stride (integer-division
+#     in load_config, used in strides tuple).
+#   - Bool toggles: spatial_attention, pooled, max_pool. Default off matches
+#     the okay_nabu / hey_jarvis published baseline.
 DEFAULT_MIXEDNET_FLAGS = {
     "pointwise_filters": "64,64,64,64",
     "repeat_in_block": "1,1,1,1",
@@ -54,6 +56,9 @@ DEFAULT_MIXEDNET_FLAGS = {
     "first_conv_filters": 32,
     "first_conv_kernel_size": 5,
     "stride": 3,
+    "spatial_attention": False,
+    "pooled": False,
+    "max_pool": False,
 }
 
 
