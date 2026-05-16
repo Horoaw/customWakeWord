@@ -39,10 +39,10 @@ ENV VIRTUAL_ENV="/opt/venv"
 RUN /opt/venv/bin/pip install --upgrade pip wheel
 
 # This is the step that fails on RunPod pod disks. Doing it at image-build
-# time on GitHub Actions' SSD instead.
+# time on GitHub Actions' SSD instead. --no-cache-dir means pip already
+# discards cached wheels after install; no separate purge needed.
 COPY requirements.txt /tmp/requirements.txt
-RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
-    && /opt/venv/bin/pip cache purge
+RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Pre-clone piper-sample-generator — saves another 30s on the pod.
 RUN git clone --depth 1 https://github.com/rhasspy/piper-sample-generator.git \
