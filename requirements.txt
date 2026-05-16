@@ -11,9 +11,20 @@ mmap-ninja                # RaggedMmap feature store used by upstream
 audiomentations>=0.36     # CPU augmentation (RIR, noise, EQ, codec)
 webrtcvad-wheels          # VAD silence removal in piper-sample-generator path
 
-# piper-sample-generator deps (cloned at runtime; these are its Python deps)
-torch>=2.2
-torchaudio>=2.2
+# piper-sample-generator deps (cloned at runtime; these are its Python deps).
+#
+# CUDA pin: RunPod's A100 SXM hosts (and most server-class hosts as of
+# 2026-05) ship CUDA driver 12.7. PyTorch's default PyPI wheel for torch>=2.7
+# is built with CUDA 13 and refuses to use a driver older than 13.x — it
+# silently falls back to CPU with a warning ("The NVIDIA driver on your
+# system is too old (found version 12070)"). 10k TTS samples on CPU at
+# A100 hourly rates is a catastrophic burn.
+#
+# Pinning to torch 2.5.1 + torchaudio 2.5.1 from the cu124 index keeps
+# us on a wheel built for CUDA 12.4 (compatible with driver 12.7+).
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchaudio==2.5.1+cu124
 piper-phonemize-cross==1.2.1
 
 # Eval + utilities
