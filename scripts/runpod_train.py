@@ -3,18 +3,27 @@
 
 Mirrors TemLLM's H100 launcher pattern: provisions a SECURE pod, runs a
 log server on :8001, drives the end-to-end pipeline, stops the pod on
-completion. The pipeline is:
+completion.
 
-  1. Install Python 3.10 (pinned to avoid OHF-Voice/micro-wake-word#62)
-  2. Clone our repo + install deps
-  3. Clone piper-sample-generator + download libritts_r generator
-  4. Run scripts/synth_positives.py (~3-10 min on a 4090)
-  5. Run scripts/synth_hard_negatives.py
-  6. Run scripts/download_hf_negatives.py (~9 GB, ~3 min)
-  7. Run scripts/build_features.py --download-aug-corpora
-  8. Run scripts/train_microwakeword.py
-  9. Run scripts/emit_manifest.py
-  10. (Optional) scripts/upload_to_hf.py
+The pod boots with our pre-baked image (ghcr.io/temm1e-labs/customwake-deps),
+so all heavy installs (apt, python3.10, venv, pip install -r requirements.txt,
+piper-sample-generator clone + libritts model) are already done at image-build
+time on GitHub Actions. The pod entrypoint only does work that depends on
+runtime state: cloning our private repo, running the data + training pipeline.
+
+This bypasses the recurring Errno 5 disk I/O failure that hit RunPod A100 SXM
+pods during pip's "Installing collected packages" phase (see LESSONS_v0.md #15).
+
+Pipeline (all run on the pod after image boot):
+  1. Clone our repo (private, via x-access-token)
+  2. Symlink /opt/piper-sample-generator -> /workspace/piper-sample-generator
+  3. scripts/synth_positives.py (~3-10 min on a 4090)
+  4. scripts/synth_hard_negatives.py
+  5. scripts/download_hf_negatives.py (~9 GB, ~3 min)
+  6. scripts/build_features.py --download-aug-corpora
+  7. scripts/train_microwakeword.py
+  8. scripts/emit_manifest.py
+  9. (Optional) scripts/upload_to_hf.py
 
 Usage:
     source scripts/load_creds.sh
@@ -38,11 +47,13 @@ GQL = "https://api.runpod.io/graphql"
 # A-spec fallback if 4090 is unavailable.
 GPU_TYPE_ID = "NVIDIA GeForce RTX 4090"
 CLOUD_TYPE = "SECURE"
-# Real RunPod pytorch tag (the "2.4.0-py3.10-..." format from 2024 docs is
-# obsolete — current catalog uses `1.0.3-cu1290-torch271-ubuntu2204`).
-# Ubuntu 22.04 ships system Python 3.10; we install python3.10 explicitly via
-# deadsnakes anyway so the base image's Python version doesn't matter.
-IMAGE = "runpod/pytorch:1.0.3-cu1290-torch271-ubuntu2204"
+# Pre-baked deps image built on GitHub Actions (see Dockerfile +
+# .github/workflows/build-deps-image.yml). The image is public on GHCR so
+# RunPod pulls it without auth. Built with python3.10 + CUDA 12.4 + tf 2.16+
+# + torch + microwakeword + piper-sample-generator pre-cloned.
+# Update the tag here when requirements.txt changes (rebuild via:
+#   gh workflow run build-deps-image -f tag=v0.2).
+IMAGE = "ghcr.io/temm1e-labs/customwake-deps:v0.1"
 HOURLY_RATE = 0.69
 
 MAX_WAIT_S = 4 * 60 * 60   # 4 h hard cap → ~$2.76 worst case
@@ -150,23 +161,19 @@ disown
         echo "[$(date +%H:%M:%S)] STAGE: $1"
     }}
 
-    write_stage "apt_install"
-    echo "[$(date +%H:%M:%S)] base python: $(python3 --version 2>&1)"
-
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq ffmpeg sox libsox-fmt-mp3 unzip wget git \
-        software-properties-common build-essential
-
-    write_stage "python310_install"
-    add-apt-repository ppa:deadsnakes/ppa -y
-    apt-get update -qq
-    apt-get install -y -qq python3.10 python3.10-venv python3.10-dev python3.10-distutils
-    echo "[$(date +%H:%M:%S)] python3.10 installed: $(python3.10 --version)"
+    write_stage "image_check"
+    # All deps live in /opt/venv (see Dockerfile). Activate up-front so every
+    # subsequent python/pip resolves there.
+    source /opt/venv/bin/activate
+    echo "[$(date +%H:%M:%S)] python: $(python --version) at $(which python)"
+    python -c "import tensorflow as tf, torch, microwakeword; \
+        print(f'  tf={{tf.__version__}} torch={{torch.__version__}}')"
 
     write_stage "git_clone"
     # Private repo — auth via GH_TOKEN env var injected into the pod payload.
-    # Temporarily disable `set -x` so the token-bearing URL isn't echoed.
+    # Temporarily disable `set -x` so the token-bearing URL isn't echoed,
+    # and pipe through sed to redact any token that does slip into git's own
+    # progress output. set -o pipefail propagates failures out of the pipe.
     repo_path=$(echo "{repo_url}" | sed -E 's|^https://github.com/||; s|\.git$||')
     {{ set +x; }} 2>/dev/null
     git clone --branch {branch} \
@@ -175,14 +182,13 @@ disown
     {{ set -x; }} 2>/dev/null
     cd /workspace/customwake
 
-    write_stage "venv_create"
-    python3.10 -m venv /workspace/.venv
-    source /workspace/.venv/bin/activate
-    pip install --upgrade pip wheel
-
-    write_stage "pip_install_requirements"
-    pip install --no-cache-dir -r requirements.txt
-    echo "[$(date +%H:%M:%S)] deps installed: $(python --version)"
+    write_stage "piper_link"
+    # piper-sample-generator was pre-cloned in /opt at image-build time; some
+    # scripts default to looking for it at /workspace/piper-sample-generator,
+    # so symlink rather than re-clone to keep the entrypoint compatible.
+    if [ ! -e /workspace/piper-sample-generator ]; then
+        ln -s /opt/piper-sample-generator /workspace/piper-sample-generator
+    fi
 
     # 1. Positives
     write_stage "synth_positives"
