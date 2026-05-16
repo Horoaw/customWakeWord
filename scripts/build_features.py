@@ -172,15 +172,25 @@ def build_features_for_corpus(wavs: list[tuple[str, str]], out_root: Path,
         if not paths:
             continue
         # RunPod pod disks intermittently fail mid-write with OSError
-        # [Errno 5], leaving zero-byte WAVs that pass `Path.exists()`
-        # but break the downstream audio decoder ("FileNotFoundError"
-        # on a broken-looking symlink). Filter aggressively here: real
-        # piper WAVs at 22 kHz mono / >=1 sec are 40+ KB, anything
-        # smaller is a corrupted write.
+        # [Errno 5], leaving WAVs in three broken states: missing,
+        # zero-byte, or size-claims-OK-but-data-never-flushed (sparse
+        # or pre-allocated). A `Path.stat().st_size` check misses the
+        # third case — the file appears non-empty but `wave.open()`
+        # errors or the datasets audio decoder hits FileNotFoundError
+        # on the symlink path. Open each WAV header to validate.
+        import wave as _wave
+        def _readable_wav(p: str) -> bool:
+            try:
+                if not Path(p).is_file() or Path(p).stat().st_size < 4096:
+                    return False
+                with _wave.open(p, "rb") as w:
+                    return w.getnframes() > 0
+            except Exception:
+                return False
         before = len(paths)
-        paths = [p for p in paths if Path(p).is_file() and Path(p).stat().st_size >= 4096]
+        paths = [p for p in paths if _readable_wav(p)]
         if len(paths) < before:
-            print(f"  ⚠ {split}: dropped {before - len(paths)} dead/empty WAV paths "
+            print(f"  ⚠ {split}: dropped {before - len(paths)} dead/unreadable WAVs "
                   f"(probably RunPod disk Errno 5 from synth stage)",
                   file=sys.stderr, flush=True)
         if not paths:
