@@ -245,3 +245,156 @@ In rough cost-saving + reliability order:
 9. **Memory-spec gating** (#4) — reject low-mem hosts before paying
 
 None of these are blockers for v0 finishing this run — they're for the next training cycle.
+
+---
+
+# Round 2 (2026-05-16/17) — the pre-baked image session
+
+The v0 patches above (custom image, log server, stage markers, DELETE-not-STOP) all landed and worked. New failures emerged from finally exercising the rest of the pipeline.
+
+## 14. Pre-baked image stops the pod-disk Errno 5 — but only for pip
+
+**Symptom (v0)**: `pip install` 5 GB of wheels on RunPod A100 SXM crashes 3/3 times with `OSError [Errno 5] Input/output error` during "Installing collected packages".
+
+**Symptom (v0.1+)**: With deps pre-baked into `ghcr.io/temm1e-labs/customwake-deps`, the install never runs on the pod and never fails. BUT — same `Errno 5` reappears during `synth_positives` when piper writes 10 000 WAVs in a tight batch loop. Same disk, different write pattern. Some WAVs are pre-allocated to their full size on disk but never have their data flushed; `Path.stat().st_size` reports the expected ~50 KB, but reading the bytes fails. We're seeing ~40% positive loss on bad-disk hosts vs ~0% on healthy ones.
+
+**Hypothesis (still untested)**: RunPod's container disk on some hosts is on a flaky NFS / loopback / sparse-file backing that handles "create + size announce" fine but loses actual writes under sustained pressure. Volume disks (mounted at `/workspace`) are more reliable.
+
+**Fix applied** (commit `baf533f`): in `scripts/build_features.py`, validate each WAV by opening with `wave.open()` before adding to the symlink farm, so genuinely broken files don't get fed to the audio decoder. Logs the drop count to stderr.
+
+**v0.2 patch idea**: in `synth_positives.py`, post-batch verify each WAV header before adding to the manifest. Don't rely on the consumer to filter.
+
+---
+
+## 15. GitHub Actions `ubuntu-latest` runs out of disk at the pip extract step
+
+**Symptom**: GHA Docker build crashes ~60% through the pip install with `OSError: [Errno 28] No space left on device`. All wheels download cleanly, then the install phase fails as files are extracted into `/opt/venv`.
+
+**Root cause**: `ubuntu-latest` ships with ~14 GB free post-toolchain. Our deps tree (torch + tf + nvidia-* + microwakeword) needs ~15–20 GB extracted plus BuildKit overlay.
+
+**Fix applied** (commit `8d19abf`): add `jlumbroso/free-disk-space@main` step before Buildx. Frees ~25 GB by removing Android SDK, .NET, Haskell, preinstalled toolchains. ~30 s overhead, gets us to ~40 GB free.
+
+---
+
+## 16. `pip cache purge` errors when chained with `--no-cache-dir`
+
+**Symptom**: `pip install --no-cache-dir ... && pip cache purge` exits 1 with `ERROR: pip cache commands can not function since cache is disabled.` After the **install successfully completed**. The chained command kills the entire Docker layer.
+
+**Fix applied** (commit `ac60875`): just drop the chained `pip cache purge`. `--no-cache-dir` already discards cached wheels per-package. Redundant.
+
+---
+
+## 17. GHCR private packages — they don't inherit from a public source repo
+
+**Symptom**: source repo `temm1e-labs/customWakeWord` is public, GHA pushes the image, image manifest is **still 401-private**. RunPod can't pull anonymously.
+
+**Root cause**: GHCR packages are independent of their source-repo visibility. By default, every new package in an org is **private** until explicitly made public.
+
+**Three-step unlock** (had to be done by the org admin in the UI; not scriptable with a `repo+workflow+admin:org` token):
+1. Organization → Settings → Packages → "Container types" → check **Public**. (Default is unchecked; UI says *"Setting is disabled by organization administrators"* on the per-package page until this is flipped.)
+2. Package settings → Danger Zone → **Change visibility** → Public → type package name to confirm.
+3. (Optional, but recommended:) toggle "Inherit access from source repository" on the package so future re-pushes don't private-revert.
+
+**Detection**: see RUNPOD_RECIPE.md §2 for the `curl` one-liner that confirms anonymous manifest fetch.
+
+**Fallback we built but didn't use**: `POST /v1/containerregistryauth` (RunPod REST) registers GHCR creds server-side, then pod create passes `containerRegistryAuthId`. Works in theory but requires a `read:packages`-scoped PAT which we didn't have. Public is simpler.
+
+---
+
+## 18. PyTorch 2.6+ defaults `torch.load(weights_only=True)` — breaks old pickles
+
+**Symptom**: piper-sample-generator v2.0.0's `generate_samples.py:74` calls `torch.load(model_path)` without args. The libritts checkpoint pickle contains `piper_train.vits.models.SynthesizerTrn`, which is not in PyTorch's safe-globals allowlist for `weights_only=True`. Errors:
+```
+_pickle.UnpicklingError: Weights only load failed. ...
+WeightsUnpickler error: Unsupported global: GLOBAL piper_train.vits.models.SynthesizerTrn
+```
+
+**Fix applied** (commit `4dbdd3a`): inline sed-patch in the Dockerfile to replace the `torch.load(model_path)` line with `torch.load(model_path, weights_only=False)`. Builds verify the patch landed via `grep -q weights_only=False`.
+
+**Why we trust the checkpoint**: it's a versioned release artefact from a known-good upstream (rhasspy/piper-sample-generator v2.0.0). We download it from GitHub Releases over HTTPS at image-build time.
+
+---
+
+## 19. Default PyPI torch is built with CUDA 13 — RunPod A100 driver is 12.7
+
+**Symptom**: `synth_positives.py` runs but logs:
+```
+UserWarning: CUDA initialization: The NVIDIA driver on your system
+is too old (found version 12070). Please update your GPU driver...
+```
+torch silently falls back to CPU. piper-sample-generator runs at ~5% of expected throughput. 10k WAVs would burn 2–3 hours of A100 time.
+
+**Root cause**: `pip install torch` (unversioned) currently pulls `torch==2.12.0+cu130`. CUDA 13 needs driver 13.0+. RunPod A100 SXM hosts ship driver 12.7.
+
+**Fix applied** (commit `89aa224`): pin via the PyTorch cu124 index:
+```
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchaudio==2.5.1+cu124
+```
+Bonus: torch 2.5 was the last version where `weights_only` defaulted to `False`, making lesson #18 redundant (but we keep the sed patch as defense in depth).
+
+**v0.2 patch idea**: add a startup check in `runpod_train.py` that queries `torch.cuda.is_available()` and abort early if False. Avoids hours of CPU-only work.
+
+---
+
+## 20. `microwakeword` submodules silently dropped by `pip install`
+
+**Symptom**: `from microwakeword.audio.augmentation import Augmentation` → `ModuleNotFoundError: No module named 'microwakeword.audio'`. Top-level `microwakeword` imports fine.
+
+**Root cause**: upstream's `setup.py` uses `packages=setuptools.find_packages()` which **requires `__init__.py` in each subdir**. The `microwakeword/audio/` and `microwakeword/layers/` directories exist in the repo but have no `__init__.py`. setuptools silently skips them at install time.
+
+**Fix applied** (commit `d15b4ca`): in the Dockerfile, clone microwakeword, `touch` the missing `__init__.py` files, then `pip install -e /opt/microwakeword`. Sanity-check the import in the same RUN layer.
+
+**Upstream PR opportunity**: send a one-line `touch __init__.py` fix to OHF-Voice/micro-wake-word. The `inference.py`, `data.py`, and `model_train_eval.py` modules import from `microwakeword.audio.*`, so this is broken for everyone, not just us.
+
+---
+
+## 21. `datasets==4.x` requires `torchcodec` for audio streaming
+
+**Symptom**: `RIR download failed: To support encoding audio data, please install 'torchcodec'.` Caused by `load_dataset("davidscripka/MIT_environmental_impulse_responses", streaming=True)` in `build_features.py`.
+
+**Fix applied** (commit `d15b4ca`): pin `datasets>=3.0,<4.0` in `requirements.txt`. 3.x uses `soundfile` for audio decode which is already installed.
+
+**v0.2 patch idea**: when 4.x adoption is forced (e.g., for a streaming dataset that requires it), add `torchcodec` to the image. Currently it's not a runtime dep we need elsewhere.
+
+---
+
+## 22. Upstream `Clips` API dropped `filepath_text_files=[...]` for glob-only
+
+**Symptom**: `TypeError: Clips.__init__() got an unexpected keyword argument 'filepath_text_files'` in `build_features.py`.
+
+**Root cause**: Previous microwakeword versions accepted a text file containing one path per line via `filepath_text_files=[...]`. The current API only accepts `input_directory: str + file_pattern: str` and uses `Path(input_directory).glob(file_pattern)` internally.
+
+**Fix applied** (commit `57c1379`): replace the manifest-file mechanism with a flat **symlink farm** per split. For each split (training/validation/testing), create `out_root/<split>/_clips/{NNNNNNN}.wav` symlinks pointing at the actual phrase-subdir WAVs. Then call `Clips(input_directory=str(symlink_dir), file_pattern="*.wav")`.
+
+**v0.2 patch idea**: pin microwakeword to a specific commit (`-e git+https://github.com/.../micro-wake-word.git@SHA`) for stability. Currently we install HEAD.
+
+---
+
+## 23. Relative-path symlinks are dangling — Unix resolves targets from the SYMLINK'S directory, not CWD
+
+**Symptom**: After the symlink farm in #22 was built, `build_features` iteration died with `FileNotFoundError: [Errno 2] No such file or directory: 'data/tofu/features/training/_clips/0007908.wav'`. The symlink existed (visible in directory listing), the target file existed (visible on disk), but `open(symlink)` errored.
+
+**Root cause**: this surprised us. The manifest stores `wav_path` as `"data/tofu/synth/positives/hey_tofu/0.wav"` — relative to /workspace/customwake (the script's CWD). We did `link.symlink_to(p)` where `p` is that relative string. The kernel stores the relative target verbatim in the inode. When something opens the symlink, the kernel resolves `"data/tofu/synth/..."` **relative to the symlink's own directory** (`/workspace/customwake/data/tofu/features/training/_clips/`), giving `/workspace/customwake/data/tofu/features/training/_clips/data/tofu/synth/positives/hey_tofu/0.wav` — which doesn't exist. Every symlink in the farm was silently dangling.
+
+**Fix applied** (commit `1116b68`): `link.symlink_to(Path(p).resolve())` so the symlink target is locked to its absolute path.
+
+**Standard Unix behavior, easy trap**: this is documented (`man symlink`), but the failure message — FileNotFoundError on the symlink path, not the target — makes it look like the symlink was never created. Spent a pod cycle ($1.50, ~30 min) on this one.
+
+---
+
+## Final cost ledger (post-v0.1 work)
+
+| Failure mode | Wasted $ | Count |
+|---|---|---|
+| Errno 5 disk during pip install (now solved by image) | $0.46 × 3 | 3 |
+| Failed GHA builds (Errno 28, pip cache purge) | $0 GHA-free | 2 |
+| Bad-host stuck (now 14 min vs 7 min) | $0.32 | 2 |
+| CUDA wheel mismatch (CPU fallback caught fast) | $0.07 | 1 |
+| microwakeword.audio missing | $0.20 | 1 |
+| Clips API drift | $0.18 | 1 |
+| Relative symlink dangling | $0.41 | 2 |
+| **Total this session** | **~$3.20** | of $17 starting balance |
+
+The cost is mostly **iteration**, not raw failure cost. Each "fix → rebuild → relaunch" cycle is ~15 min of wall and $0.30–$0.50 of GPU time. Bundling fixes into a single rebuild whenever possible compresses this.

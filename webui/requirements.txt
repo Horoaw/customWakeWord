@@ -1,0 +1,12 @@
+# Pinned for HF Spaces / local Gradio. Kept LIGHT — no train-time deps,
+# no microwakeword install (we vendor the feature extractor in app.py).
+gradio>=4.40,<6.0
+ai-edge-litert>=1.0
+numpy>=1.26,<2.0
+scipy>=1.11
+matplotlib>=3.8
+huggingface_hub>=0.24
+
+# C MicroFrontend — produces the same mel features the on-device TFLite-Micro
+# runtime uses. ~100 kB wheel. Ships from rhasspy/pymicro-features.
+pymicro-features>=2.0
