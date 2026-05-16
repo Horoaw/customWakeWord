@@ -46,18 +46,28 @@ def load_model(hf_repo: str) -> tuple[Interpreter, dict, float]:
     if hf_repo in _MODEL_CACHE:
         return _MODEL_CACHE[hf_repo]
 
-    # The training pipeline uploads three files we care about: the .tflite,
-    # the ESPHome manifest.json, and a model card. We need the .tflite and
-    # the manifest (for probability_cutoff + feature dimensions).
-    tflite_path = hf_hub_download(repo_id=hf_repo, filename="model.tflite")
-    try:
+    # The training pipeline uploads the .tflite under a project-specific
+    # name (e.g. `tofu-wakeword-v0.tflite`), so auto-discover by listing the
+    # repo and grabbing the first .tflite found. ESPHome v2 manifest may
+    # land as `manifest.json` (preferred) or be embedded in `esphome.yaml`;
+    # if neither is present we fall back to DEFAULT_THRESHOLD.
+    from huggingface_hub import HfApi
+    api = HfApi()
+    siblings = api.list_repo_files(repo_id=hf_repo, repo_type="model")
+    tflite_name = next((f for f in siblings if f.endswith(".tflite")), None)
+    if not tflite_name:
+        raise RuntimeError(
+            f"No .tflite in repo {hf_repo}. "
+            f"Files seen: {siblings}"
+        )
+    tflite_path = hf_hub_download(repo_id=hf_repo, filename=tflite_name)
+
+    manifest, cutoff = {}, DEFAULT_THRESHOLD
+    if "manifest.json" in siblings:
         mf_path = hf_hub_download(repo_id=hf_repo, filename="manifest.json")
         manifest = json.loads(Path(mf_path).read_text())
         cutoff = float(manifest.get("micro", {}).get("probability_cutoff",
                                                      DEFAULT_THRESHOLD))
-    except Exception:
-        manifest = {}
-        cutoff = DEFAULT_THRESHOLD
 
     interp = Interpreter(model_path=tflite_path)
     interp.allocate_tensors()
