@@ -209,13 +209,20 @@ def build_features_for_corpus(wavs: list[tuple[str, str]], out_root: Path,
         # `input_directory + file_pattern` only — symlinks let us keep
         # the original storage layout (per-phrase subdirs) while
         # presenting a flat view to Clips without copying WAV bytes.
+        #
+        # CRITICAL: symlinks store their target string verbatim, and the
+        # kernel resolves relative targets from the SYMLINK'S directory,
+        # not from the process CWD. The manifest's wav_path is relative
+        # ("data/tofu/synth/positives/hey_tofu/0.wav") which would point
+        # to a non-existent location when followed from
+        # data/tofu/features/training/_clips/. Resolve to absolute first.
         symlink_dir = out_root / split / "_clips"
         symlink_dir.mkdir(parents=True, exist_ok=True)
         for old in symlink_dir.glob("*.wav"):
             old.unlink()
         for i, p in enumerate(paths):
             link = symlink_dir / f"{i:07d}.wav"
-            link.symlink_to(p)
+            link.symlink_to(Path(p).resolve())
 
         clips = Clips(input_directory=str(symlink_dir), file_pattern="*.wav")
 
