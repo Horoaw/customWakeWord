@@ -48,12 +48,17 @@ GQL = "https://api.runpod.io/graphql"
 GPU_TYPE_ID = "NVIDIA GeForce RTX 4090"
 CLOUD_TYPE = "SECURE"
 # Pre-baked deps image built on GitHub Actions (see Dockerfile +
-# .github/workflows/build-deps-image.yml). The image is public on GHCR so
-# RunPod pulls it without auth. Built with python3.10 + CUDA 12.4 + tf 2.16+
+# .github/workflows/build-deps-image.yml). The package is private on GHCR
+# (the operator's PAT lacks write:packages to flip visibility programmatically),
+# so RunPod pulls with credentials registered via the REST API
+# `/containerregistryauth`. Built with python3.10 + CUDA 12.4 + tf 2.16+
 # + torch + microwakeword + piper-sample-generator pre-cloned.
 # Update the tag here when requirements.txt changes (rebuild via:
 #   gh workflow run build-deps-image -f tag=v0.2).
 IMAGE = "ghcr.io/temm1e-labs/customwake-deps:v0.1"
+# Registered via: POST /v1/containerregistryauth (name=ghcr-temm1e-labs).
+# Listed via:    GET  /v1/containerregistryauth
+CONTAINER_REGISTRY_AUTH_ID = "cmp8d7wke000fic07rm9hxk7r"
 HOURLY_RATE = 0.69
 
 MAX_WAIT_S = 4 * 60 * 60   # 4 h hard cap → ~$2.76 worst case
@@ -251,6 +256,7 @@ def build_payload(project: str, repo_url: str, branch: str, hf_repo_id: str | No
     return {
         "name": f"customwake-{project}",
         "imageName": IMAGE,
+        "containerRegistryAuthId": CONTAINER_REGISTRY_AUTH_ID,
         "gpuTypeIds": [gpu_type_id],
         "gpuCount": 1,
         "vcpuCount": 8,
