@@ -50,13 +50,24 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 # `python -m piper_sample_generator` invocation, and dropped the implicit
 # model resolution that our synth scripts rely on (they don't pass --model).
 # Stay on v2.0.0 until scripts/synth_*.py migrates to the new API.
+#
+# Inline patch: PyTorch 2.6 flipped `torch.load`'s default `weights_only`
+# from False → True. The libritts_r-medium.pt checkpoint contains
+# `piper_train.vits.models.SynthesizerTrn` which is not on the safe-globals
+# allowlist, so the default load fails. We trust the upstream checkpoint,
+# so add `weights_only=False`. Failing to patch produces:
+#   _pickle.UnpicklingError: Weights only load failed. ... WeightsUnpickler
+#   error: Unsupported global: GLOBAL piper_train.vits.models.SynthesizerTrn
 RUN git clone --depth 1 --branch v2.0.0 \
         https://github.com/rhasspy/piper-sample-generator.git \
         /opt/piper-sample-generator \
     && mkdir -p /opt/piper-sample-generator/models \
     && wget -q -O /opt/piper-sample-generator/models/en_US-libritts_r-medium.pt \
         https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt \
-    && test -f /opt/piper-sample-generator/generate_samples.py
+    && test -f /opt/piper-sample-generator/generate_samples.py \
+    && sed -i 's/torch\.load(model_path)/torch.load(model_path, weights_only=False)/' \
+        /opt/piper-sample-generator/generate_samples.py \
+    && grep -q 'weights_only=False' /opt/piper-sample-generator/generate_samples.py
 
 # Sanity check — fail the build if any critical import breaks
 RUN /opt/venv/bin/python -c "import tensorflow as tf; print('tf', tf.__version__)" \
