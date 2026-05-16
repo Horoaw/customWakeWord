@@ -1,0 +1,71 @@
+name: build-deps-image
+
+# Manually-triggered build of the deps Docker image. Pushes to
+# ghcr.io/temm1e-labs/customwake-deps:<tag>.
+#
+# Why manual: the image is ~5 GB and takes ~15-20 min to build. We only
+# rebuild when requirements.txt changes meaningfully. Trigger with:
+#   gh workflow run build-deps-image -f tag=v0.1
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (e.g. v0.1, v0.2)"
+        required: true
+        default: "v0.1"
+      push_latest:
+        description: "Also push `latest` tag"
+        required: false
+        default: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push (versioned)
+        if: ${{ inputs.push_latest == 'false' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ghcr.io/temm1e-labs/customwake-deps:${{ inputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build + push (versioned + latest)
+        if: ${{ inputs.push_latest != 'false' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/temm1e-labs/customwake-deps:${{ inputs.tag }}
+            ghcr.io/temm1e-labs/customwake-deps:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image summary
+        run: |
+          echo "::notice ::Pushed ghcr.io/temm1e-labs/customwake-deps:${{ inputs.tag }}"
+          echo "::notice ::Pull with: docker pull ghcr.io/temm1e-labs/customwake-deps:${{ inputs.tag }}"
