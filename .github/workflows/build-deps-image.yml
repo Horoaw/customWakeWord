@@ -29,6 +29,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # GHA ubuntu-latest ships with ~14 GB free disk after preinstalled
+      # toolchains. The deps tree (torch + tf + nvidia-* + microwakeword)
+      # needs ~15-20 GB extracted, plus BuildKit overlay. First v0.1 build
+      # hit Errno 28 No space left ~60% through the install. Frees ~25 GB
+      # by deleting Android SDK, .NET, Haskell, dotnet, large preinstalls.
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false  # leaves apt cache intact — fast
+          docker-images: false   # we use docker, keep its cache
+          swap-storage: false
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
