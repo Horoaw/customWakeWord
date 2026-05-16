@@ -171,6 +171,22 @@ def build_features_for_corpus(wavs: list[tuple[str, str]], out_root: Path,
     for split, paths in by_split.items():
         if not paths:
             continue
+        # RunPod pod disks intermittently fail mid-write with OSError
+        # [Errno 5], leaving zero-byte WAVs that pass `Path.exists()`
+        # but break the downstream audio decoder ("FileNotFoundError"
+        # on a broken-looking symlink). Filter aggressively here: real
+        # piper WAVs at 22 kHz mono / >=1 sec are 40+ KB, anything
+        # smaller is a corrupted write.
+        before = len(paths)
+        paths = [p for p in paths if Path(p).is_file() and Path(p).stat().st_size >= 4096]
+        if len(paths) < before:
+            print(f"  ⚠ {split}: dropped {before - len(paths)} dead/empty WAV paths "
+                  f"(probably RunPod disk Errno 5 from synth stage)",
+                  file=sys.stderr, flush=True)
+        if not paths:
+            print(f"  ⚠ {split}: no usable WAVs after filter, skipping split",
+                  file=sys.stderr, flush=True)
+            continue
         mmap_dir = out_root / split / "wakeword_mmap"
         if mmap_dir.exists():
             print(f"  ✓ {split}: {mmap_dir} already exists, skipping", flush=True)
