@@ -10,6 +10,11 @@
 # Pinned by microwakeword itself, but listed here so `pip install -r` on a
 # bare environment doesn't try to resolve a wildcard:
 tensorflow>=2.16
+# CuDNN pin: TF 2.21 ships with `nvidia-cudnn-cu12==9.1.0.70` in its
+# transitive constraints but was actually compiled against 9.3+, producing:
+#   "Loaded runtime CuDNN library: 9.1.0 but source was compiled with: 9.3.0"
+# Pin explicitly above the 9.3 floor so the constraint resolves correctly.
+nvidia-cudnn-cu12>=9.3,<10
 ai-edge-litert            # tflite runtime (for inference + eval)
 pymicro-features          # C audio_microfrontend op (must match runtime)
 mmap-ninja                # RaggedMmap feature store used by upstream
