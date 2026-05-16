@@ -55,7 +55,7 @@ CLOUD_TYPE = "SECURE"
 # + torch + microwakeword + piper-sample-generator pre-cloned.
 # Update the tag here when requirements.txt changes (rebuild via:
 #   gh workflow run build-deps-image -f tag=v0.2).
-IMAGE = "ghcr.io/temm1e-labs/customwake-deps:v0.3"
+IMAGE = "ghcr.io/temm1e-labs/customwake-deps:v0.4"
 # Registered via: POST /v1/containerregistryauth (name=ghcr-temm1e-labs).
 # Listed via:    GET  /v1/containerregistryauth
 CONTAINER_REGISTRY_AUTH_ID = "cmp8d7wke000fic07rm9hxk7r"
