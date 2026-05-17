@@ -384,6 +384,38 @@ Bonus: torch 2.5 was the last version where `weights_only` defaulted to `False`,
 
 ---
 
+## 24. `clip_duration_ms` must be divisible by `window_step_ms × stride`
+
+**Symptom**: training runs successfully through 10k steps, then crashes at INT8 quantization export with:
+
+```python
+File "/opt/microwakeword/microwakeword/utils.py", line 321, in representative_dataset_gen
+    assert spectrogram.shape[0] % stride == 0
+AssertionError
+```
+
+The trained Keras model is on disk but the `.tflite` is never produced — pipeline dies halfway through `evaluate_model`. Hit this on greet's first run after I dropped `clip_duration_ms` from tofu's 1500 to 1000 to suppress context noise on bare greetings.
+
+**Root cause**: microwakeword's calibration generator (`utils.py:318-324`) requires the spectrogram time-dim to divide evenly by the model's streaming stride. With the defaults from `scripts/train_microwakeword.py`:
+- `window_step_ms = 10` (so spectrogram has `clip_duration_ms / 10` slices)
+- `stride = 3` (MixedNet default in `MIXEDNET_DEFAULTS`)
+
+The constraint is `clip_duration_ms % 30 == 0`. Tofu's 1500 ms satisfies (150 % 3 = 0). 1000 ms doesn't (100 % 3 = 1). Bumping to 1020 fixes it (102 % 3 = 0).
+
+**Fix**: when setting `clip_duration_ms` for any new project, round up to the nearest multiple of 30:
+
+```python
+clip_duration_ms = math.ceil(target_ms / 30) * 30
+```
+
+Or for `stride != 3`, multiple of `window_step_ms × stride`.
+
+**Cost**: ~$0.20 — the failure happens at the END of training, so you lose the entire train phase (~20 min on RTX 3090) plus the 25 min synth + features prior. Mitigation: the wrapper can be rerun on the SAME pod with `git pull` instead of `git clone` to preserve synth + features, restoring just the 20 min training cost (~$0.15).
+
+**TODO for the pipeline**: `train_microwakeword.py` should validate this constraint at startup before paying for training. One-line `assert clip_duration_ms % (window_step_ms * stride) == 0` saves the full train cycle.
+
+---
+
 ## Final cost ledger (post-v0.1 work)
 
 | Failure mode | Wasted $ | Count |

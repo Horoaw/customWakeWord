@@ -143,6 +143,26 @@ def main() -> int:
     )
 
     config = load_config(flags, mixednet)
+
+    # Guard against LESSONS_v0.md #24: microwakeword's INT8 quantization
+    # calibration (utils.py:321) asserts spectrogram.shape[0] % stride == 0.
+    # Catch the mismatch BEFORE we burn 20 min of training only to crash at
+    # the final TFLite export.
+    spec_len = config["spectrogram_length"]
+    stride = config["stride"]
+    if spec_len % stride != 0:
+        step_ms = config["window_step_ms"]
+        nearest_lo = (spec_len // stride) * stride * step_ms
+        nearest_hi = ((spec_len + stride - 1) // stride) * stride * step_ms
+        print(
+            f"ERROR: spectrogram_length={spec_len} not divisible by stride={stride}.\n"
+            f"  Set clip_duration_ms to a multiple of {step_ms * stride} "
+            f"(nearest: {nearest_lo} ms or {nearest_hi} ms).\n"
+            f"  See LESSONS_v0.md #24.",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+
     data_processor = input_data.FeatureHandler(config)
     model = mixednet.model(
         flags,
