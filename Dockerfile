@@ -55,6 +55,13 @@ RUN git clone --depth 1 https://github.com/OHF-Voice/micro-wake-word.git \
         /opt/microwakeword \
     && touch /opt/microwakeword/microwakeword/audio/__init__.py \
     && touch /opt/microwakeword/microwakeword/layers/__init__.py \
+    && sed -i \
+        -e 's/result\["fp"\]\.numpy()/np.asarray(result["fp"])/g' \
+        -e 's/ambient_predictions\["tp"\]\.numpy()/np.asarray(ambient_predictions["tp"])/g' \
+        -e 's/ambient_predictions\["fp"\]\.numpy()/np.asarray(ambient_predictions["fp"])/g' \
+        -e 's/ambient_predictions\["fn"\]\.numpy()/np.asarray(ambient_predictions["fn"])/g' \
+        /opt/microwakeword/microwakeword/train.py \
+    && grep -q 'np\.asarray(result\["fp"\])' /opt/microwakeword/microwakeword/train.py \
     && /opt/venv/bin/pip install --no-cache-dir -e /opt/microwakeword \
     && /opt/venv/bin/python -c \
         "from microwakeword.audio.augmentation import Augmentation; \

@@ -1,0 +1,92 @@
+# Upstream microWakeWord training config for the Greet wake-word v0.
+#
+# Same schema as tofu/training_parameters.yaml. Tweaked for the
+# bare-greeting failure modes:
+#   - hard_negatives penalty_weight bumped 5 → 10 (FP cost is much higher
+#     because greetings are extremely common in normal speech)
+#   - hard_negatives sampling_weight bumped 3 → 6 (over-expose the model
+#     to the embedded-greeting / rhyme buckets so it learns to suppress)
+#   - negative_class_weight bumped 20 → 35 (per-batch loss skew toward
+#     "don't fire" since FP is more painful than FR for this use case)
+#
+# `train_dir` is overwritten by the wrapper at runtime to point at
+# `trained_models/<project>/`.
+
+train_dir: trained_models/greet
+
+# Feature window step in ms — must match scripts/build_features.py
+window_step_ms: 10
+
+# Wake-detection decision window. Shortened to 1000 ms since "hey" / "hi"
+# are sub-500ms utterances and a 1500ms window admits more context noise.
+clip_duration_ms: 1000
+
+features:
+  # 1. Greet positives
+  - features_dir: data/greet/features
+    sampling_weight: 2.0
+    penalty_weight: 1.0
+    truth: true
+    truncation_strategy: truncate_start
+    type: mmap
+
+  # 2. Greet hard negatives — penalty_weight DOUBLED vs tofu (5 → 10).
+  #    These are the embedded-greeting + rhyme + other-wake-word buckets;
+  #    suppressing them is the entire reason this model exists.
+  - features_dir: data/greet/hard_negatives_features
+    sampling_weight: 6.0
+    penalty_weight: 10.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 3. LibriSpeech + VOiCES speech (~300 h) — bumped 10 → 15 to over-expose
+  #    the model to general speech containing incidental "hey/hi/hello"
+  - features_dir: data/negative_datasets/speech
+    sampling_weight: 15.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 4. CHiME6 dinner-party (real multi-talker, conversational TV-like) —
+  #    bumped 15 → 25 because real households talk this way at dinner
+  #    and our model needs to learn that "hey pass the salt" isn't a wake.
+  - features_dir: data/negative_datasets/dinner_party
+    sampling_weight: 25.0
+    penalty_weight: 5.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 5. Eval ambient (val/test only)
+  - features_dir: data/negative_datasets/dinner_party_eval
+    sampling_weight: 0.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: split
+    type: mmap
+
+# Single-phase training. Same 10k steps as tofu but with heavier FP suppression.
+training_steps: [10000]
+positive_class_weight: [1]
+negative_class_weight: [35]
+learning_rates: [0.001]
+
+batch_size: 128
+
+# No SpecAugment — same rationale as tofu.
+time_mask_max_size: [0]
+time_mask_count: [0]
+freq_mask_max_size: [0]
+freq_mask_count: [0]
+
+eval_step_interval: 500
+
+# Picky selection: tighter FA budget (0.5 → 0.25/hr) and pick by
+# average_viable_recall across cutoffs. The high probability_cutoff in
+# manifest.json (default 0.85; bump to 0.95 for deployment) is the
+# OTHER half of FP suppression.
+target_minimization: 0.25
+minimization_metric: null
+maximization_metric: average_viable_recall

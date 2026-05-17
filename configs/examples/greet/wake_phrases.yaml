@@ -1,0 +1,63 @@
+# Phrases we want the model to fire on.
+#
+# v0 (greet): bare greetings — "hey", "hi", "hello". This is an
+# experimental model deliberately chosen to MEASURE the failure modes
+# of using common single-syllable greetings as wake words. The expected
+# real-world false-positive rate is high (people say "hey" 50-200x per
+# day in normal household speech); the hard_negatives.yaml here is much
+# richer than the tofu equivalent specifically to push the model toward
+# requiring crisper articulation.
+#
+# Each phrase entry is sampled at training time. The `count` field is the
+# absolute target after de-duplication; `weight` reweights loss per-sample.
+
+phrases:
+  - text: "hey"
+    count: 4000
+    weight: 1.0
+    notes: |
+      Most common greeting. Most exposure.
+  - text: "hi"
+    count: 3000
+    weight: 1.0
+    notes: |
+      Shorter than "hey", harder to distinguish from "high", "buy", etc.
+  - text: "hello"
+    count: 3000
+    weight: 1.0
+    notes: |
+      Two syllables — phonetically richer than the others, so equal count.
+
+# TTS variation grid — every (voice, phrase) is rendered at each speed in the
+# list. Total renders ≈ count_per_phrase × len(speeds).
+variation:
+  speeds: [0.85, 0.95, 1.05, 1.15]
+  emotions:
+    parler:  # only used when engine == parler
+      - "speaking calmly, neutral"
+      - "speaking excitedly, slightly fast"
+      - "speaking softly, almost whispering"
+      - "speaking with a friendly child-like tone"
+  random_seed: 42
+
+engines:
+  - name: piper
+    weight: 0.5
+    voices: ALL
+  - name: kokoro
+    weight: 0.25
+    voices: ALL_EN
+  - name: melotts
+    weight: 0.15
+    voices: [EN-US, EN-BR, EN-AU, EN-IN]
+  - name: parler
+    weight: 0.10
+    voices: [random_seed_grid_20]
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  format: wav
+  trim_silence: true
+  target_duration_s: 1.0   # shorter than tofu (1.5s) — these are short words
+  pad_with_silence_if_short: true

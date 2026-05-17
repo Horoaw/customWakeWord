@@ -174,6 +174,22 @@ disown
     python -c "import tensorflow as tf, torch, microwakeword; \
         print(f'  tf={{tf.__version__}} torch={{torch.__version__}}')"
 
+    # Patch any v0.5-era image artifacts at pod start. v0.6+ images bake
+    # these in (requirements.txt has the cudnn + tensorboard pins; Dockerfile
+    # sed-patches train.py), so these become no-ops on v0.6+ — but the
+    # `pip install --upgrade` is idempotent and `sed` matches nothing once
+    # already patched, so they're safe to leave in for older image tags.
+    write_stage "image_patch"
+    pip install --no-cache-dir --upgrade \
+        "nvidia-cudnn-cu12>=9.3,<10" "tensorboard>=2.16" >/dev/null
+    # microwakeword train.py: .numpy() on what newer TF returns as ndarray
+    sed -i \
+        -e 's/result\["fp"\]\.numpy()/np.asarray(result["fp"])/g' \
+        -e 's/ambient_predictions\["tp"\]\.numpy()/np.asarray(ambient_predictions["tp"])/g' \
+        -e 's/ambient_predictions\["fp"\]\.numpy()/np.asarray(ambient_predictions["fp"])/g' \
+        -e 's/ambient_predictions\["fn"\]\.numpy()/np.asarray(ambient_predictions["fn"])/g' \
+        /opt/microwakeword/microwakeword/train.py
+
     write_stage "git_clone"
     # Private repo — auth via GH_TOKEN env var injected into the pod payload.
     # Temporarily disable `set -x` so the token-bearing URL isn't echoed,
@@ -223,6 +239,11 @@ disown
     fi
 
     # 5. Train + INT8 export
+    write_stage "clean_prev_run"
+    # Upstream model_train_eval refuses to overwrite trained_models/{project}.
+    # Wipe any stale run from a previous failed boot.
+    rm -rf trained_models/{project}
+
     write_stage "train"
     python scripts/train_microwakeword.py --project {project} \
         --training-config configs/examples/{project}/training_parameters.yaml

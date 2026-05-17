@@ -1,0 +1,168 @@
+# Adversarial / collision phrases. The model must NOT fire on these.
+#
+# v0 (greet): heavily expanded vs the tofu equivalent because
+# hey/hi/hello are embedded in almost every conversational greeting.
+# Total ~3000 hard-negatives (vs ~2500 for tofu) with much wider
+# bucket coverage of real-world embedded-greeting failure modes.
+
+buckets:
+  # Bucket 1: addressed-to-someone-else greetings. The model needs to
+  # learn that "hey + word" usually means a human-to-human greeting,
+  # not a wake-word. This is the single biggest deployment failure.
+  - id: greeting_to_other
+    target_count: 600
+    phrases:
+      - "hey there"
+      - "hey you"
+      - "hey buddy"
+      - "hey friend"
+      - "hey man"
+      - "hey kid"
+      - "hey mom"
+      - "hey dad"
+      - "hey honey"
+      - "hey sweetie"
+      - "hi there"
+      - "hi friend"
+      - "hi mom"
+      - "hi dad"
+      - "hi sweetie"
+      - "hi everyone"
+      - "hello there"
+      - "hello friend"
+      - "hello world"
+      - "hello everyone"
+
+  # Bucket 2: other commercial wake-words people might say. Critical to
+  # not fire when the user is intending to wake a different device.
+  - id: other_wake_words
+    target_count: 300
+    phrases:
+      - "hey siri"
+      - "hey google"
+      - "hey alexa"
+      - "hey jarvis"
+      - "hey nabu"
+      - "hi alexa"
+      - "hello google"
+
+  # Bucket 3: "hey" rhymes / phonemic neighbors. Suppress firing on
+  # similarly-shaped vowel sounds that aren't the intended greeting.
+  - id: hey_rhymes
+    target_count: 400
+    phrases:
+      - "they"
+      - "way"
+      - "say"
+      - "may"
+      - "okay"
+      - "today"
+      - "play"
+      - "stay"
+      - "they say"
+      - "no way"
+
+  # Bucket 4: "hi" rhymes. Single-syllable high-vowel words that
+  # the model could collapse onto.
+  - id: hi_rhymes
+    target_count: 400
+    phrases:
+      - "high"
+      - "hike"
+      - "buy"
+      - "by"
+      - "my"
+      - "die"
+      - "sky"
+      - "pie"
+      - "tie"
+      - "lie"
+      - "why"
+      - "fly"
+
+  # Bucket 5: "hello" rhymes / final-vowel collisions.
+  - id: hello_rhymes
+    target_count: 300
+    phrases:
+      - "yellow"
+      - "fellow"
+      - "mellow"
+      - "below"
+      - "follow"
+      - "hollow"
+      - "swallow"
+      - "shall I"
+      - "shadow"
+
+  # Bucket 6: embedded-in-sentence greetings. Real conversational
+  # contexts where the greeting is preceded or followed by other speech.
+  # The model must NOT fire on these because the intent is human-to-human.
+  - id: embedded_greeting
+    target_count: 500
+    phrases:
+      - "say hello to her"
+      - "I said hi"
+      - "she said hey"
+      - "they said hello"
+      - "he wants to say hi"
+      - "tell them hello"
+      - "tell her I said hey"
+      - "we said hi to them"
+      - "hi how are you"
+      - "hey what's up"
+      - "hello can you hear me"
+      - "hey wait a second"
+      - "hi I'm calling about"
+      - "hey can you grab the milk"
+      - "hello may I help you"
+
+  # Bucket 7: greeting + name. Common pet/family-member addressing.
+  - id: greeting_plus_name
+    target_count: 300
+    phrases:
+      - "hey michael"
+      - "hi sarah"
+      - "hello david"
+      - "hey grandma"
+      - "hi grandpa"
+      - "hello max"        # common dog name
+      - "hi luna"          # common pet name
+      - "hey bella"
+
+  # Bucket 8: filler / interjection uses. "Hey!" as a standalone
+  # exclamation (surprise, mild protest, getting attention).
+  - id: interjection
+    target_count: 200
+    phrases:
+      - "hey!"
+      - "hey watch out"
+      - "hey stop that"
+      - "hey come here"
+      - "hi-five"
+      - "hi-fi"
+
+engines:
+  - name: piper
+    weight: 0.5
+    voices: ALL
+  - name: kokoro
+    weight: 0.25
+    voices: ALL_EN
+  - name: melotts
+    weight: 0.15
+    voices: [EN-US, EN-BR, EN-AU, EN-IN]
+  - name: parler
+    weight: 0.10
+    voices: [random_seed_grid_20]
+
+variation:
+  speeds: [0.85, 0.95, 1.05, 1.15]
+  random_seed: 4242
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  format: wav
+  trim_silence: true
+  target_duration_s: 1.5  # hard-negs use 1.5s so embedded-greeting clips fit
+  pad_with_silence_if_short: true
