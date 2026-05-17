@@ -67,6 +67,7 @@ def main() -> int:
     psg_dir = ensure_psg(Path(args.psg_dir))
 
     manifest_rows: list[dict] = []
+    shortfalls: list[tuple[str, str, int, int]] = []
     for bucket in buckets:
         bid = bucket["id"]
         bucket_count = max(1, int(round(bucket["target_count"] * scale)))
@@ -78,9 +79,11 @@ def main() -> int:
         print(f"  bucket {bid}: {len(phrases)} phrases × {per_phrase} samples = {per_phrase*len(phrases)}", flush=True)
         for phrase in phrases:
             phrase_dir = out_root / f"{bid}__{slug(phrase)}"
-            generate_for_phrase(psg_dir, phrase, phrase_dir, per_phrase,
-                                batch_size=args.batch_size,
-                                max_speakers=args.max_speakers)
+            actual, ok = generate_for_phrase(psg_dir, phrase, phrase_dir, per_phrase,
+                                             batch_size=args.batch_size,
+                                             max_speakers=args.max_speakers)
+            if not ok:
+                shortfalls.append((bid, phrase, actual, per_phrase))
             for wav in sorted(phrase_dir.glob("*.wav")):
                 manifest_rows.append({
                     "file_id": f"{bid}__{slug(phrase)}__{wav.stem}",
@@ -91,6 +94,17 @@ def main() -> int:
                     "engine": "piper_sample_generator",
                     "voice_model": GEN_MODEL_NAME,
                 })
+
+    if shortfalls:
+        print("\n=== FAILED: some hard-negative phrases short of target ===", file=sys.stderr)
+        for bid, phrase, actual, count in shortfalls:
+            pct = 100 * actual / count if count else 0
+            print(f"  ✗ {bid}/{phrase}: {actual}/{count} ({pct:.0f}%)",
+                  file=sys.stderr)
+        print("Not writing manifest. Wipe data/<project>/synth/hard_negatives "
+              "and rerun; the pod disk likely had a transient I/O error "
+              "(see RUNPOD_RECIPE.md).", file=sys.stderr)
+        return 1
 
     mfp = out_root / "manifest.jsonl"
     with mfp.open("w") as f:

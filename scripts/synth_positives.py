@@ -28,6 +28,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -78,13 +79,24 @@ def ensure_psg(psg_dir: Path) -> Path:
 
 def generate_for_phrase(psg_dir: Path, phrase: str, out_dir: Path,
                         count: int, batch_size: int = 100,
-                        max_speakers: int | None = 904) -> int:
-    """Run piper-sample-generator for one phrase. Return number of WAVs produced."""
+                        max_speakers: int | None = 904,
+                        *, max_retries: int = 3,
+                        min_ratio: float = 0.95,
+                        retry_sleep_s: float = 10.0,
+                        ) -> tuple[int, bool]:
+    """Run piper-sample-generator for one phrase.
+
+    Returns (actual_wav_count, ok). ok=False if after `max_retries` attempts
+    the on-disk count is still below `min_ratio * count` — typically a
+    transient RunPod disk Errno 5 or piper-internal failure that didn't
+    recover. The caller is expected to treat ok=False as fatal (don't write
+    the manifest; exit non-zero so the wrapper script's `set -e` aborts).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     existing = list(out_dir.glob("*.wav"))
     if len(existing) >= count:
         print(f"  ✓ {phrase}: already have {len(existing)} ≥ {count}, skipping", flush=True)
-        return len(existing)
+        return len(existing), True
 
     needed = count - len(existing)
     print(f"  → {phrase}: generating {needed} more ({len(existing)} already on disk)", flush=True)
@@ -99,13 +111,36 @@ def generate_for_phrase(psg_dir: Path, phrase: str, out_dir: Path,
     if max_speakers is not None:
         cmd.extend(["--max-speakers", str(max_speakers)])
 
-    try:
-        subprocess.check_call(cmd)
-    except subprocess.CalledProcessError as e:
-        print(f"  ✗ piper-sample-generator failed for '{phrase}': {e}", file=sys.stderr)
-        return len(list(out_dir.glob("*.wav")))
+    for attempt in range(1, max_retries + 1):
+        try:
+            subprocess.check_call(cmd)
+            break
+        except subprocess.CalledProcessError as e:
+            actual = len(list(out_dir.glob("*.wav")))
+            if attempt >= max_retries:
+                print(
+                    f"  ✗ {phrase}: failed after {max_retries} attempts ({e}); "
+                    f"{actual}/{count} on disk",
+                    file=sys.stderr, flush=True,
+                )
+                break
+            print(
+                f"  ⚠ {phrase}: attempt {attempt}/{max_retries} failed ({e}); "
+                f"{actual}/{count} on disk, retrying in {retry_sleep_s:.0f}s",
+                file=sys.stderr, flush=True,
+            )
+            time.sleep(retry_sleep_s)
+            new_needed = count - actual
+            if new_needed <= 0:
+                break
+            for i, tok in enumerate(cmd):
+                if tok == "--max-samples":
+                    cmd[i + 1] = str(new_needed)
+                    break
 
-    return len(list(out_dir.glob("*.wav")))
+    actual = len(list(out_dir.glob("*.wav")))
+    ok = actual >= int(count * min_ratio)
+    return actual, ok
 
 
 def write_manifest(positives_root: Path, by_phrase: dict[str, Path]) -> None:
@@ -172,12 +207,26 @@ def main() -> int:
     psg_dir = ensure_psg(Path(args.psg_dir))
 
     by_phrase: dict[str, Path] = {}
+    shortfalls: list[tuple[str, int, int]] = []
     for phrase, count in per_phrase_count.items():
         phrase_dir = out_root / slug(phrase)
         by_phrase[phrase] = phrase_dir
-        generate_for_phrase(psg_dir, phrase, phrase_dir, count,
-                            batch_size=args.batch_size,
-                            max_speakers=args.max_speakers)
+        actual, ok = generate_for_phrase(psg_dir, phrase, phrase_dir, count,
+                                         batch_size=args.batch_size,
+                                         max_speakers=args.max_speakers)
+        if not ok:
+            shortfalls.append((phrase, actual, count))
+
+    if shortfalls:
+        print("\n=== FAILED: some phrases short of target ===", file=sys.stderr)
+        for phrase, actual, count in shortfalls:
+            pct = 100 * actual / count if count else 0
+            print(f"  ✗ {phrase}: {actual}/{count} ({pct:.0f}%)",
+                  file=sys.stderr)
+        print("Not writing manifest. Wipe data/<project>/synth/positives "
+              "and rerun; the pod disk likely had a transient I/O error "
+              "(see RUNPOD_RECIPE.md).", file=sys.stderr)
+        return 1
 
     write_manifest(out_root, by_phrase)
 

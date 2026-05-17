@@ -4,6 +4,14 @@
 
 Give it a phrase. It gives you a wake-word model.
 
+> ⚠ **Firmware compatibility.** Our output is an INT8 `.tflite` for
+> ESPHome's `micro_wake_word`. It does **not** load on XiaoZhi,
+> ESP-S3-BOX-3 stock firmware, or anything else built on Espressif's
+> `esp-sr` — those expect a `wn9_*.bin` WakeNet model in a proprietary
+> format with no public converter. See
+> [`RELEASE_PROTOCOL.md`](RELEASE_PROTOCOL.md) for the full target matrix
+> and the five paths to producing an ESP-SR companion model.
+
 ```
 python scripts/init_wake.py --name sunny --phrases "hey sunny,hi sunny,okay sunny"
 /wake-synth sunny       # synthesize ~12k positives + ~2.5k hard-negatives via TTS
