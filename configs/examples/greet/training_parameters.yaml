@@ -17,9 +17,18 @@ train_dir: trained_models/greet
 # Feature window step in ms — must match scripts/build_features.py
 window_step_ms: 10
 
-# Wake-detection decision window. Shortened to 1000 ms since "hey" / "hi"
-# are sub-500ms utterances and a 1500ms window admits more context noise.
-clip_duration_ms: 1000
+# Wake-detection decision window. Shortened from tofu's 1500 ms since
+# "hey" / "hi" are sub-500ms utterances and a longer window admits more
+# context noise.
+#
+# Value MUST be divisible by (window_step_ms × model_stride) or upstream
+# microwakeword's INT8 quantization calibration fails with
+#   AssertionError: spectrogram.shape[0] % stride == 0
+# (utils.py:321, in representative_dataset_gen). With window_step_ms=10
+# and stride=3 (the MixedNet default in scripts/train_microwakeword.py),
+# the constraint is `clip_duration_ms % 30 == 0`. 1020 ms is the smallest
+# stride-compatible value ≥ 1000. Tofu's 1500 also satisfies (1500 % 30 = 0).
+clip_duration_ms: 1020
 
 features:
   # 1. Greet positives
