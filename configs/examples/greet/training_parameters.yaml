@@ -21,14 +21,24 @@ window_step_ms: 10
 # "hey" / "hi" are sub-500ms utterances and a longer window admits more
 # context noise.
 #
-# Value MUST be divisible by (window_step_ms × model_stride) or upstream
-# microwakeword's INT8 quantization calibration fails with
+# Value MUST produce a `spectrogram_length` divisible by model `stride` or
+# upstream microwakeword's INT8 quantization calibration fails with
 #   AssertionError: spectrogram.shape[0] % stride == 0
-# (utils.py:321, in representative_dataset_gen). With window_step_ms=10
-# and stride=3 (the MixedNet default in scripts/train_microwakeword.py),
-# the constraint is `clip_duration_ms % 30 == 0`. 1020 ms is the smallest
-# stride-compatible value ≥ 1000. Tofu's 1500 also satisfies (1500 % 30 = 0).
-clip_duration_ms: 1020
+# (utils.py:321, in representative_dataset_gen). The naive `c % 30 == 0`
+# heuristic is WRONG — spectrogram_length is offset by `slices_dropped`
+# (= 154 for the MixedNet defaults: first_conv_kernel=5, repeat=[1,1,1,1],
+# kernels=[[5],[7,11],[9,15],[23]], stride=3).
+#
+# The real formula (from microwakeword/model_train_eval.py::load_config):
+#   spec_len = 1 + (c*16 - 480) / (stride * step_ms * 16 / 1000) + slices_dropped
+#   With stride=3, step_ms=10, slices_dropped=154 →
+#   spec_len = c/30 + 154
+#   Need spec_len % 3 == 0 → c % 90 == 60
+# So valid clip_duration_ms ∈ {60, 150, 240, ..., 960, 1050, 1140, 1500, ...}
+#
+# 1050 ms is the smallest stride-compatible value ≥ 1000 ms. Tofu's 1500
+# also satisfies (1500 % 90 = 60 ✓). 1000 and 1020 don't.
+clip_duration_ms: 1050
 
 features:
   # 1. Greet positives

@@ -146,19 +146,50 @@ def main() -> int:
 
     # Guard against LESSONS_v0.md #24: microwakeword's INT8 quantization
     # calibration (utils.py:321) asserts spectrogram.shape[0] % stride == 0.
-    # Catch the mismatch BEFORE we burn 20 min of training only to crash at
-    # the final TFLite export.
+    # The relationship between clip_duration_ms and spectrogram_length is
+    # `spec_len = clip_duration_ms/30 + slices_dropped` for stride=3, but
+    # slices_dropped depends on the model architecture (kernel sizes etc.)
+    # so we can't print a closed-form valid clip_duration_ms. Instead, do
+    # an iterative ±step_ms search using the same load_config logic, so
+    # the suggestion is correct for whatever MixedNet variant is in flags.
     spec_len = config["spectrogram_length"]
     stride = config["stride"]
     if spec_len % stride != 0:
         step_ms = config["window_step_ms"]
-        nearest_lo = (spec_len // stride) * stride * step_ms
-        nearest_hi = ((spec_len + stride - 1) // stride) * stride * step_ms
+        cur_ms = int(config["clip_duration_ms"])
+
+        def _spec_len_at(c_ms):
+            """Replay the load_config arithmetic to predict spectrogram_length
+            at a hypothetical clip_duration_ms, without mutating config."""
+            ws_samples = stride * 16 * step_ms  # = window_step_samples
+            length_minus_window = 16 * c_ms - 16 * 30  # 30 ms window
+            if length_minus_window < 0:
+                final = 0
+            else:
+                final = 1 + length_minus_window // ws_samples
+            return final + mixednet.spectrogram_slices_dropped(flags)
+
+        # Search up + down by step_ms; bias to the smaller change.
+        valid_up = None
+        valid_down = None
+        for delta in range(step_ms, 30 * step_ms + 1, step_ms):
+            if valid_up is None:
+                if _spec_len_at(cur_ms + delta) % stride == 0:
+                    valid_up = cur_ms + delta
+            if valid_down is None and cur_ms - delta > 0:
+                if _spec_len_at(cur_ms - delta) % stride == 0:
+                    valid_down = cur_ms - delta
+            if valid_up is not None and valid_down is not None:
+                break
+
+        suggestions = []
+        if valid_down: suggestions.append(f"{valid_down} ms (-{cur_ms - valid_down})")
+        if valid_up:   suggestions.append(f"{valid_up} ms (+{valid_up - cur_ms})")
         print(
-            f"ERROR: spectrogram_length={spec_len} not divisible by stride={stride}.\n"
-            f"  Set clip_duration_ms to a multiple of {step_ms * stride} "
-            f"(nearest: {nearest_lo} ms or {nearest_hi} ms).\n"
-            f"  See LESSONS_v0.md #24.",
+            f"ERROR: clip_duration_ms={cur_ms} produces spectrogram_length={spec_len},\n"
+            f"  which is not divisible by stride={stride}. Suggested fix:\n"
+            f"    clip_duration_ms: {', or '.join(suggestions) if suggestions else '<no value found within ±300 ms>'}\n"
+            f"  See LESSONS_v0.md #24 for the load_config arithmetic.",
             file=sys.stderr, flush=True,
         )
         return 1

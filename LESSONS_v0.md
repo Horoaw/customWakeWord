@@ -384,7 +384,7 @@ Bonus: torch 2.5 was the last version where `weights_only` defaulted to `False`,
 
 ---
 
-## 24. `clip_duration_ms` must be divisible by `window_step_ms × stride`
+## 24. `clip_duration_ms` constraint is subtler than it looks — depends on `slices_dropped`
 
 **Symptom**: training runs successfully through 10k steps, then crashes at INT8 quantization export with:
 
@@ -394,25 +394,48 @@ File "/opt/microwakeword/microwakeword/utils.py", line 321, in representative_da
 AssertionError
 ```
 
-The trained Keras model is on disk but the `.tflite` is never produced — pipeline dies halfway through `evaluate_model`. Hit this on greet's first run after I dropped `clip_duration_ms` from tofu's 1500 to 1000 to suppress context noise on bare greetings.
+The trained Keras model is on disk but the `.tflite` is never produced — pipeline dies halfway through `evaluate_model`. Hit this twice on greet's debug cycle: once with `clip_duration_ms=1000` (the original "shorter than tofu" pick), once with `1020` (after my first wrong-formula fix).
 
-**Root cause**: microwakeword's calibration generator (`utils.py:318-324`) requires the spectrogram time-dim to divide evenly by the model's streaming stride. With the defaults from `scripts/train_microwakeword.py`:
-- `window_step_ms = 10` (so spectrogram has `clip_duration_ms / 10` slices)
-- `stride = 3` (MixedNet default in `MIXEDNET_DEFAULTS`)
+**Root cause + the actual constraint**:
 
-The constraint is `clip_duration_ms % 30 == 0`. Tofu's 1500 ms satisfies (150 % 3 = 0). 1000 ms doesn't (100 % 3 = 1). Bumping to 1020 fixes it (102 % 3 = 0).
-
-**Fix**: when setting `clip_duration_ms` for any new project, round up to the nearest multiple of 30:
+The naive guess `clip_duration_ms % 30 == 0` (= `% (window_step_ms × stride)`) is **wrong**. Microwakeword's `load_config` (`model_train_eval.py:50-90`) computes:
 
 ```python
-clip_duration_ms = math.ceil(target_ms / 30) * 30
+desired_samples    = 16 * clip_duration_ms                     # 16 kHz
+window_step_samples = stride * 16 * window_step_ms / 1000      # NOTE: includes stride
+spec_len_final     = 1 + (desired_samples - 480) / window_step_samples
+spectrogram_length = spec_len_final + slices_dropped(flags)    # OFFSET
 ```
 
-Or for `stride != 3`, multiple of `window_step_ms × stride`.
+Where `slices_dropped` (`mixednet.py::spectrogram_slices_dropped`) is:
 
-**Cost**: ~$0.20 — the failure happens at the END of training, so you lose the entire train phase (~20 min on RTX 3090) plus the 25 min synth + features prior. Mitigation: the wrapper can be rerun on the SAME pod with `git pull` instead of `git clone` to preserve synth + features, restoring just the 20 min training cost (~$0.15).
+```python
+slices_dropped = (first_conv_kernel_size - 1)                  # from first conv
+              + sum(repeat * (max(ksize) - 1) * stride          # from each block
+                    for repeat, ksize in zip(repeats, mixconv_kernel_sizes))
+```
 
-**TODO for the pipeline**: `train_microwakeword.py` should validate this constraint at startup before paying for training. One-line `assert clip_duration_ms % (window_step_ms * stride) == 0` saves the full train cycle.
+With the MixedNet defaults in `scripts/train_microwakeword.py` (kernel=5, repeats=[1,1,1,1], kernels=[[5],[7,11],[9,15],[23]], stride=3):
+
+`slices_dropped = 4 + 12 + 30 + 42 + 66 = 154`
+
+So `spectrogram_length = clip_duration_ms/30 + 154`. The constraint becomes:
+
+```
+(clip_duration_ms / 30 + 154) % 3 == 0
+clip_duration_ms / 30 ≡ 2 (mod 3)            # since 154 = 51*3 + 1, so 154 % 3 = 1
+clip_duration_ms ≡ 60 (mod 90)               # multiply both sides by 30
+```
+
+**Valid clip_duration_ms values: 60, 150, 240, 330, 420, 510, 600, 690, 780, 870, 960, 1050, 1140, ..., 1500, ...**
+
+Tofu's 1500 works (1500 % 90 = 60). 1000 and 1020 don't. **1050 ms is the smallest value ≥ 1000 that works.**
+
+**For different MixedNet variants** (custom kernel sizes / repeats / stride), the residue class changes. The right move is to just compute `spectrogram_length % stride` directly via `load_config` — do not eyeball a divisor.
+
+**Fix**: `scripts/train_microwakeword.py` does this now (since commit 6ebcb52, refined in TBD), failing fast before any GPU spend with a suggested valid `clip_duration_ms` via a `±90 ms` iterative search.
+
+**Cost paid by this lesson**: ~$0.40 over two failed train cycles. Mitigation: pre-flight check at startup before paying for the train phase. The wrapper's `git pull` resume preserves synth + features so each retry costs only the ~20 min training step, not 50.
 
 ---
 
