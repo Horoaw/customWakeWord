@@ -43,16 +43,25 @@ The wake phrase is configured near the top of
 PROJECT_NAME="${PROJECT_NAME:-xingxing}"
 WAKE_PHRASES="${WAKE_PHRASES:-星星}"
 LANGUAGE="${LANGUAGE:-zh}"
+GPU_DEVICE="${GPU_DEVICE:-0}"       # eighth physical GPU = 7
 ```
 
 You can also override the settings without editing the file:
 
 ```bash
+GPU_DEVICE=7 \
 PROJECT_NAME=nihao_xingxing \
 WAKE_PHRASES="你好星星" \
 LANGUAGE=zh \
 bash scripts/train_local_server.sh
 ```
+
+`GPU_DEVICE` uses the zero-based physical index reported by `nvidia-smi`, so
+the eighth card is `7`. A full GPU UUID such as `GPU-...` is also accepted and
+is safer when device numbering may change. The launcher validates the selected
+card before starting, exposes only that card to Docker, and requires
+TensorFlow inside the container to see exactly one GPU. Other cards remain
+unavailable to the training process.
 
 Use a new `PROJECT_NAME` whenever the wake phrase changes. The launcher checks
 existing YAML before training and refuses to mix old audio/features with a new

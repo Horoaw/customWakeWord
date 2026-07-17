@@ -7,7 +7,7 @@
 #
 # Public Hugging Face downloads do not require HF_TOKEN. The script uses the
 # pre-built dependency image, so the host only needs Docker, an NVIDIA driver,
-# and NVIDIA Container Toolkit (`docker run --gpus all ...`).
+# and NVIDIA Container Toolkit (`docker run --gpus ...`).
 
 set -Eeuo pipefail
 
@@ -45,6 +45,10 @@ MANIFEST_THRESHOLD="${MANIFEST_THRESHOLD:-}"
 # Dependency image built from this repository's Dockerfile.
 TRAIN_IMAGE="${TRAIN_IMAGE:-ghcr.io/temm1e-labs/customwake-deps:v0.5}"
 
+# Physical GPU index shown by `nvidia-smi`, or a full GPU UUID. GPU numbering
+# starts at 0, so the eighth card is 7. Exactly one GPU is exposed to Docker.
+GPU_DEVICE="${GPU_DEVICE:-0}"
+
 # ---------------------------------------------------------------------------
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,6 +75,10 @@ fi
 if [[ ! "${MODEL_VERSION}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
     die "MODEL_VERSION may only contain letters, numbers, _, . or -."
 fi
+if [[ ! "${GPU_DEVICE}" =~ ^[0-9]+$ \
+   && ! "${GPU_DEVICE}" =~ ^GPU-[a-fA-F0-9-]+$ ]]; then
+    die "GPU_DEVICE must be a non-negative nvidia-smi index or a full GPU UUID."
+fi
 
 # Host-side entry: launch the same script inside the reproducible GPU image.
 if [[ "${CUSTOMWAKE_IN_CONTAINER:-0}" != "1" ]]; then
@@ -78,13 +86,22 @@ if [[ "${CUSTOMWAKE_IN_CONTAINER:-0}" != "1" ]]; then
     docker info >/dev/null 2>&1 || die "Docker daemon is not running or is not accessible."
     command -v nvidia-smi >/dev/null 2>&1 || die "NVIDIA driver/nvidia-smi is not available."
 
-    stage "Host GPU"
-    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+    selected_gpu_info="$(
+        nvidia-smi -i "${GPU_DEVICE}" \
+            --query-gpu=index,uuid,name,memory.total,driver_version \
+            --format=csv,noheader 2>&1
+    )" || die "GPU_DEVICE=${GPU_DEVICE} is unavailable: ${selected_gpu_info}"
+
+    stage "Selected host GPU"
+    printf '%s\n' "${selected_gpu_info}"
+    GPU_REQUEST="device=${GPU_DEVICE}"
 
     docker_args=(
-        run --rm --pull=missing --gpus all --shm-size=8g
+        run --rm --pull=missing --gpus "${GPU_REQUEST}" --shm-size=8g
         --user "$(id -u):$(id -g)"
         --env CUSTOMWAKE_IN_CONTAINER=1
+        --env "GPU_DEVICE=${GPU_DEVICE}"
+        --env EXPECTED_GPU_COUNT=1
         --env "PROJECT_NAME=${PROJECT_NAME}"
         --env "WAKE_PHRASES=${WAKE_PHRASES}"
         --env "LANGUAGE=${LANGUAGE}"
@@ -119,7 +136,11 @@ TRAIN_DIR="trained_models/${PROJECT_NAME}-${MODEL_VERSION}"
 MODEL_PATH="models/${PROJECT_NAME}-wakeword-${MODEL_VERSION}.tflite"
 
 stage "Container preflight"
+printf 'Requested host GPU: %s\n' "${GPU_DEVICE}"
+nvidia-smi --query-gpu=index,uuid,name,memory.total,driver_version \
+    --format=csv,noheader
 "${PYTHON_BIN}" - <<'PY'
+import os
 import sys
 
 if sys.version_info[:2] != (3, 10):
@@ -131,14 +152,16 @@ import piper
 import pymicro_features
 
 gpus = tf.config.list_physical_devices("GPU")
+expected_gpu_count = int(os.environ.get("EXPECTED_GPU_COUNT", "1"))
 print(f"Python: {sys.version.split()[0]}")
 print(f"TensorFlow: {tf.__version__}")
 print(f"TensorFlow GPUs: {gpus}")
-if not gpus:
+if len(gpus) != expected_gpu_count:
     raise SystemExit(
-        "TensorFlow cannot see a GPU. Check NVIDIA Container Toolkit and "
-        "verify: docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi"
+        f"TensorFlow expected {expected_gpu_count} GPU, but sees {len(gpus)}. "
+        "Check GPU_DEVICE and NVIDIA Container Toolkit."
     )
+print(f"Selected GPU details: {tf.config.experimental.get_device_details(gpus[0])}")
 PY
 
 stage "Wake-word configuration"

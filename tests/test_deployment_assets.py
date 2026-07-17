@@ -41,3 +41,14 @@ def test_requirements_match_pinned_microwakeword_numpy_floor():
 
     assert "tensorflow>=2.18,<2.22" in requirements
     assert "numpy>=2.0,<2.1" in requirements
+
+
+def test_local_server_launcher_exposes_only_the_selected_gpu():
+    launcher = (ROOT / "scripts/train_local_server.sh").read_text(encoding="utf-8")
+
+    assert 'GPU_DEVICE="${GPU_DEVICE:-0}"' in launcher
+    assert 'nvidia-smi -i "${GPU_DEVICE}"' in launcher
+    assert 'GPU_REQUEST="device=${GPU_DEVICE}"' in launcher
+    assert '--gpus "${GPU_REQUEST}"' in launcher
+    assert "--env EXPECTED_GPU_COUNT=1" in launcher
+    assert "if len(gpus) != expected_gpu_count:" in launcher
