@@ -183,8 +183,10 @@ def main() -> int:
                 break
 
         suggestions = []
-        if valid_down: suggestions.append(f"{valid_down} ms (-{cur_ms - valid_down})")
-        if valid_up:   suggestions.append(f"{valid_up} ms (+{valid_up - cur_ms})")
+        if valid_down:
+            suggestions.append(f"{valid_down} ms (-{cur_ms - valid_down})")
+        if valid_up:
+            suggestions.append(f"{valid_up} ms (+{valid_up - cur_ms})")
         print(
             f"ERROR: clip_duration_ms={cur_ms} produces spectrogram_length={spec_len},\n"
             f"  which is not divisible by stride={stride}. Suggested fix:\n"
@@ -227,7 +229,7 @@ def main() -> int:
         print(f"WARN: expected {src} not produced", file=sys.stderr)
         return 2
 
-    print(f"\nNext: pick `probability_cutoff` from the table above, then:")
+    print("\nNext: pick `probability_cutoff` from the table above, then:")
     print(f"  python scripts/emit_manifest.py --project {project} --threshold <cutoff>")
     return 0
 

@@ -60,10 +60,8 @@ will hear:
 4. **Threshold** is read from `manifest.json` (`micro.probability_cutoff`),
    the same JSON ESPHome loads next to the `.tflite`.
 
-There are intentionally no smoothing, debounce, or VAD layers — those
-live in ESPHome's `micro_wake_word` component on the device. The raw
-per-window probability trace lets you see what the model thinks
-moment-to-moment.
+The UI applies the manifest's `sliding_window_size` to match ESPHome's wake-word
+decision smoothing. VAD and post-detection automation still remain device-side.
 
 ## Adding your own model
 

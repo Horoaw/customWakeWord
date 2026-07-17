@@ -41,12 +41,12 @@ def pick_threshold_from_eval(eval_json: Path,
                              max_far_per_hour: float = 0.5) -> float:
     """Read the ROC table from an eval JSON and return the best operating point."""
     data = json.loads(eval_json.read_text())
-    roc = data.get("summary", {}).get("roc") or data.get("roc", [])
+    summary = data.get("summary", {})
+    roc = summary.get("roc") or data.get("roc", [])
     if not roc:
-        # eval/runner.py at v0 emits a single operating point per --threshold.
-        # Default to 0.85 if we have no curve to read from.
-        print(f"WARN: {eval_json} has no ROC; defaulting threshold=0.85", file=sys.stderr)
-        return 0.85
+        if "threshold" in summary:
+            return float(summary["threshold"])
+        raise ValueError(f"{eval_json} contains neither an ROC curve nor a threshold")
     candidates = [r for r in roc if r.get("recall", 0) >= target_recall
                   and r.get("far_per_hour", 1e9) <= max_far_per_hour]
     if not candidates:
@@ -80,8 +80,8 @@ def main() -> int:
     ap.add_argument("--author", default=None,
                     help="Author for the manifest (default: $USER or 'tofuWakeWord').")
     ap.add_argument("--website", default="https://github.com/temm1e-labs/customWakeWord")
-    ap.add_argument("--languages", default="en",
-                    help="Comma-separated language codes (ISO 639-1).")
+    ap.add_argument("--languages", default=None,
+                    help="Comma-separated language codes; defaults to wake_phrases.yaml.")
     ap.add_argument("--out", default=None,
                     help="Default: configs/examples/<project>/manifest.json")
     args = ap.parse_args()
@@ -94,15 +94,40 @@ def main() -> int:
     out = Path(args.out) if args.out else Path(
         f"configs/examples/{project}/manifest.json")
 
+    if not tflite.is_file():
+        print(f"ERROR: trained model not found: {tflite}", file=sys.stderr)
+        return 1
+
     if args.threshold is not None:
         threshold = args.threshold
     elif eval_path.exists():
-        threshold = pick_threshold_from_eval(eval_path, args.target_recall,
-                                             args.max_far_per_hour)
+        try:
+            eval_data = json.loads(eval_path.read_text(encoding="utf-8"))
+            summary = eval_data.get("summary", {})
+            if summary.get("n_positives", 0) <= 0:
+                raise ValueError("evaluation contains no positive tasks")
+            if summary.get("bulk_stream_minutes", 0) <= 0:
+                raise ValueError("evaluation contains no measured bulk-negative audio")
+            threshold = pick_threshold_from_eval(eval_path, args.target_recall,
+                                                 args.max_far_per_hour)
+        except (ValueError, KeyError, TypeError) as e:
+            print(f"ERROR: cannot select threshold: {e}", file=sys.stderr)
+            return 1
     else:
-        print(f"WARN: --threshold not given and {eval_path} missing; "
-              f"defaulting to 0.85", file=sys.stderr)
-        threshold = 0.85
+        print(f"ERROR: provide --threshold or a valid eval result at {eval_path}",
+              file=sys.stderr)
+        return 1
+
+    languages = args.languages
+    if languages is None:
+        project_config = Path(f"configs/examples/{project}/wake_phrases.yaml")
+        language = "en"
+        if project_config.exists():
+            import yaml
+            language = yaml.safe_load(project_config.read_text(encoding="utf-8")).get(
+                "language", "en"
+            )
+        languages = language
 
     import os
     author = args.author or os.environ.get("USER") or "tofuWakeWord"
@@ -114,7 +139,7 @@ def main() -> int:
         "author": author,
         "website": args.website,
         "model": tflite.name,
-        "trained_languages": [s.strip() for s in args.languages.split(",") if s.strip()],
+        "trained_languages": [s.strip() for s in languages.split(",") if s.strip()],
         "version": 2,
         "micro": {
             "probability_cutoff": float(threshold),
@@ -125,7 +150,8 @@ def main() -> int:
         },
     }
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(manifest, indent=2) + "\n")
+    out.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
     print(f"=== wrote {out} ===")
     print(json.dumps(manifest, indent=2))
     return 0

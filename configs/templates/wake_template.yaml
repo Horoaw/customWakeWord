@@ -11,6 +11,7 @@
 # layout below.
 
 wake_name: "tofu"   # lowercase slug — used in file paths and artefact names
+language: "en"
 
 phrases:
   - text: "hey tofu"          # primary trigger
@@ -39,17 +40,8 @@ variation:
 
 engines:
   - name: piper
-    weight: 0.5
-    voices: ALL          # use every installed Piper voice
-  - name: kokoro
-    weight: 0.25
-    voices: ALL_EN
-  - name: melotts
-    weight: 0.15
-    voices: [EN-US, EN-BR, EN-AU, EN-IN]
-  - name: parler
-    weight: 0.10
-    voices: [random_seed_grid_20]
+    weight: 1.0
+    voices: ALL          # English LibriTTS-R generator
 
 audio:
   sample_rate: 16000

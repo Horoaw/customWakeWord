@@ -234,10 +234,7 @@ micro_wake_word:
   microphone: tofu_mic
   vad:
   models:
-    - model: tofu
-      probability_cutoff: 0.85
-      sliding_window_size: 5
-      url: https://huggingface.co/<your_username>/tofu-wakeword-v0/resolve/main/tofu-wakeword-v0.tflite
+    - model: https://huggingface.co/<your_username>/tofu-wakeword-v0/resolve/main/manifest.json
   on_wake_word_detected:
     - logger.log:
         format: "wake word: %s"

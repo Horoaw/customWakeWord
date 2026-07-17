@@ -85,19 +85,9 @@ buckets:
       - "go to"
 
 engines:
-  # same engine mix as positives for distribution parity
   - name: piper
-    weight: 0.5
+    weight: 1.0
     voices: ALL
-  - name: kokoro
-    weight: 0.25
-    voices: ALL_EN
-  - name: melotts
-    weight: 0.15
-    voices: [EN-US, EN-BR, EN-AU, EN-IN]
-  - name: parler
-    weight: 0.10
-    voices: [random_seed_grid_20]
 
 variation:
   speeds: [0.85, 0.95, 1.05, 1.15]

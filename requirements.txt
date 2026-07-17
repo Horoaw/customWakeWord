@@ -9,7 +9,7 @@
 
 # Pinned by microwakeword itself, but listed here so `pip install -r` on a
 # bare environment doesn't try to resolve a wildcard:
-tensorflow>=2.16
+tensorflow>=2.18,<2.22
 # CuDNN pin: TF 2.21 ships with `nvidia-cudnn-cu12==9.1.0.70` in its
 # transitive constraints but was actually compiled against 9.3+, producing:
 #   "Loaded runtime CuDNN library: 9.1.0 but source was compiled with: 9.3.0"
@@ -22,6 +22,7 @@ audiomentations>=0.36     # CPU augmentation (RIR, noise, EQ, codec)
 webrtcvad-wheels          # VAD silence removal in piper-sample-generator path
 
 # piper-sample-generator deps (cloned at runtime; these are its Python deps).
+piper-tts>=1.3,<2         # direct standard ONNX synthesis (Mandarin, etc.)
 #
 # CUDA pin: RunPod's A100 SXM hosts (and most server-class hosts as of
 # 2026-05) ship CUDA driver 12.7. PyTorch's default PyPI wheel for torch>=2.7
@@ -40,7 +41,9 @@ piper-phonemize-cross==1.2.1
 # Eval + utilities
 librosa>=0.10
 soundfile>=0.12
-numpy>=1.26,<2.0
+# Current pinned microWakeWord requires NumPy 2.x. TensorFlow 2.18's supported
+# floor/ceiling makes the 2.0 line the reproducible intersection.
+numpy>=2.0,<2.1
 scipy>=1.11
 pyyaml>=6.0
 jsonlines>=4.0

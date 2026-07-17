@@ -36,6 +36,7 @@ detector that should fire on these phrases:
 {phrases_block}
 
 The wake word itself is: "{wake_word}"
+The primary language is: "{language}". Generate phrases in that language.
 
 Generate a JSON object with the following fields, each holding 15-30 short phrases that:
 
@@ -57,14 +58,14 @@ Constraints:
 - Return ONLY a JSON object, no markdown fences, no commentary."""
 
 
-def load_phrases(project: Path) -> tuple[str, list[str]]:
+def load_phrases(project: Path) -> tuple[str, list[str], str]:
     pp = project / "wake_phrases.yaml"
     if not pp.exists():
         raise FileNotFoundError(f"{pp} not found — run init_wake.py first")
     cfg = yaml.safe_load(pp.read_text())
     phrases = [p["text"] for p in cfg["phrases"]]
     wake_word = cfg.get("wake_name") or phrases[0].split()[-1]
-    return wake_word, phrases
+    return wake_word, phrases, cfg.get("language", "en")
 
 
 def call_together(model: str, prompt: str) -> str:
@@ -131,7 +132,9 @@ def merge_into_negatives(project: Path, suggestions: dict) -> None:
             if isinstance(p, str) and p.strip():
                 existing.add(p.strip())
         by_id[bucket_id]["phrases"] = sorted(existing)
-    hn_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    hn_path.write_text(
+        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
 
 
 def main() -> int:
@@ -148,11 +151,12 @@ def main() -> int:
         print(f"ERROR: {project} not found. Run init_wake.py first.", file=sys.stderr)
         return 1
 
-    wake_word, phrases = load_phrases(project)
+    wake_word, phrases, language = load_phrases(project)
     phrases_block = "\n".join(f"  - {p}" for p in phrases)
     prompt = PROMPT_TEMPLATE.format(
         phrases_block=phrases_block,
         wake_word=wake_word,
+        language=language,
     )
 
     backend_fn, default_model = BACKENDS[args.backend]

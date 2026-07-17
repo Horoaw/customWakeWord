@@ -7,6 +7,7 @@
 Writes:
     configs/examples/sunny/wake_phrases.yaml      ← positive phrases
     configs/examples/sunny/hard_negatives.yaml    ← auto-generated collisions
+    configs/examples/sunny/training_parameters.yaml ← training config
     configs/examples/sunny/README.md              ← per-project notes
 
 The hard-negatives are generated with a simple phonetic-similarity
@@ -25,13 +26,24 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import yaml
 
 
 def slugify(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+    """Return a filesystem-safe, Unicode-preserving project id."""
+    normalized = unicodedata.normalize("NFKC", s).lower().strip()
+    return re.sub(r"[^\w-]+", "_", normalized, flags=re.UNICODE).strip("_")
+
+
+def detect_language(phrases: list[str]) -> str:
+    """Infer the primary language for sensible project defaults."""
+    text = "".join(phrases)
+    if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        return "zh"
+    return "en"
 
 
 def parse_csv(s: str, cast=str):
@@ -108,29 +120,53 @@ def generate_rhymes(word: str, limit: int = 12) -> list[str]:
     return sorted(out)[:limit]
 
 
+def build_engines(language: str) -> list[dict]:
+    if language == "zh":
+        return [{
+            "name": "piper",
+            "weight": 1.0,
+            "voices": [
+                {
+                    "id": "zh_CN-xiao_ya-medium",
+                    "model_url": (
+                        "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                        "zh/zh_CN/xiao_ya/medium/zh_CN-xiao_ya-medium.onnx"
+                    ),
+                    "config_url": (
+                        "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                        "zh/zh_CN/xiao_ya/medium/zh_CN-xiao_ya-medium.onnx.json"
+                    ),
+                },
+                {
+                    "id": "zh_CN-huayan-x_low",
+                    "model_url": (
+                        "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                        "zh/zh_CN/huayan/x_low/zh_CN-huayan-x_low.onnx"
+                    ),
+                    "config_url": (
+                        "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                        "zh/zh_CN/huayan/x_low/zh_CN-huayan-x_low.onnx.json"
+                    ),
+                },
+            ],
+        }]
+    return [{"name": "piper", "weight": 1.0, "voices": "ALL"}]
+
+
 def build_phrases_yaml(name: str, phrases: list[str], counts: list[int],
-                       weights: list[float], seed: int) -> dict:
+                       weights: list[float], seed: int, language: str) -> dict:
+    wake_word = split_wake_word(phrases)
+
     cfg = {
-        "wake_name": name,
+        "project_name": name,
+        "wake_name": wake_word,
+        "language": language,
         "phrases": [],
         "variation": {
             "speeds": [0.85, 0.95, 1.05, 1.15],
-            "emotions": {
-                "parler": [
-                    "speaking calmly, neutral",
-                    "speaking excitedly, slightly fast",
-                    "speaking softly, almost whispering",
-                    "speaking with a friendly child-like tone",
-                ],
-            },
             "random_seed": seed,
         },
-        "engines": [
-            {"name": "piper", "weight": 0.5, "voices": "ALL"},
-            {"name": "kokoro", "weight": 0.25, "voices": "ALL_EN"},
-            {"name": "melotts", "weight": 0.15, "voices": ["EN-US", "EN-BR", "EN-AU", "EN-IN"]},
-            {"name": "parler", "weight": 0.10, "voices": ["random_seed_grid_20"]},
-        ],
+        "engines": build_engines(language),
         "audio": {
             "sample_rate": 16000,
             "channels": 1,
@@ -149,16 +185,52 @@ def build_phrases_yaml(name: str, phrases: list[str], counts: list[int],
     return cfg
 
 
-def build_hard_negatives_yaml(name: str, wake_word: str, primary_phrase: str,
-                              seed: int) -> dict:
-    rhymes = generate_rhymes(wake_word, limit=10)
-    # Build buckets with reasonable defaults; users will edit.
-    rhyme_phrases = [f"to-{wake_word[1:]}" if len(wake_word) > 1 else ""]
+def build_hard_negatives_yaml(name: str, wake_word: str, seed: int, language: str,
+                              positive_phrases: list[str]) -> dict:
+    rhymes = generate_rhymes(wake_word, limit=10) if language == "en" else []
+    # Build buckets with reasonable defaults; language-specific phonetic
+    # neighbors still need human/LLM review.
+    rhyme_phrases = ([f"to-{wake_word[1:]}" if len(wake_word) > 1 else ""]
+                      if language == "en" else [])
     rhyme_phrases.extend(rhymes)
     rhyme_phrases = [p for p in rhyme_phrases if p and p != wake_word][:12]
 
+    if language == "zh":
+        greeting_phrases = ["你好", "嗨", "您好", "早上好", "晚上好"]
+        standalone_context = [
+            f"我刚才说了{wake_word}",
+            f"你听见{wake_word}了吗",
+            f"电视里提到了{wake_word}",
+        ]
+        contextual = [
+            f"我喜欢{wake_word}",
+            f"我们来聊聊{wake_word}",
+            f"那个{wake_word}在哪里",
+            f"{wake_word}真的很好",
+        ]
+    else:
+        greeting_phrases = [
+            "hey there", "hi there", "hello world",
+            "hey buddy", "hi friend", "hello everyone",
+        ]
+        standalone_context = [
+            f"the {wake_word}", f"that {wake_word}",
+            f"my {wake_word}", f"a {wake_word}",
+        ]
+        contextual = [
+            f"I like {wake_word}", f"do we have any {wake_word}",
+            f"where is the {wake_word}", f"{wake_word} is great",
+        ]
+
+    positive_set = {p.strip().casefold() for p in positive_phrases}
+
+    def without_positives(items: list[str]) -> list[str]:
+        return [p for p in items if p.strip().casefold() not in positive_set]
+
     return {
-        "wake_name": name,
+        "project_name": name,
+        "wake_name": wake_word,
+        "language": language,
         "buckets": [
             {
                 "id": "rhyme_collisions",
@@ -170,33 +242,19 @@ def build_hard_negatives_yaml(name: str, wake_word: str, primary_phrase: str,
                 "id": "greeting_no_wake",
                 "target_count": 300,
                 "notes": "Greetings that don't address the wake word.",
-                "phrases": [
-                    "hey there", "hi there", "hello world",
-                    "hey buddy", "hi friend", "hello everyone",
-                ],
+                "phrases": greeting_phrases,
             },
             {
                 "id": "wake_no_greeting",
                 "target_count": 500,
-                "notes": f"'{wake_word}' alone — must NOT fire.",
-                "phrases": [
-                    wake_word,
-                    f"the {wake_word}",
-                    f"that {wake_word}",
-                    f"my {wake_word}",
-                    f"a {wake_word}",
-                ],
+                "notes": f"Context containing '{wake_word}' that should not fire.",
+                "phrases": without_positives(standalone_context),
             },
             {
                 "id": "contextual_use",
                 "target_count": 300,
                 "notes": f"'{wake_word}' used in normal speech.",
-                "phrases": [
-                    f"I like {wake_word}",
-                    f"do we have any {wake_word}",
-                    f"where is the {wake_word}",
-                    f"{wake_word} is great",
-                ],
+                "phrases": without_positives(contextual),
             },
             {
                 "id": "near_match_words",
@@ -205,12 +263,7 @@ def build_hard_negatives_yaml(name: str, wake_word: str, primary_phrase: str,
                 "phrases": [],
             },
         ],
-        "engines": [
-            {"name": "piper", "weight": 0.5, "voices": "ALL"},
-            {"name": "kokoro", "weight": 0.25, "voices": "ALL_EN"},
-            {"name": "melotts", "weight": 0.15, "voices": ["EN-US", "EN-BR", "EN-AU", "EN-IN"]},
-            {"name": "parler", "weight": 0.10, "voices": ["random_seed_grid_20"]},
-        ],
+        "engines": build_engines(language),
         "variation": {
             "speeds": [0.85, 0.95, 1.05, 1.15],
             "random_seed": seed + 4200,
@@ -223,6 +276,70 @@ def build_hard_negatives_yaml(name: str, wake_word: str, primary_phrase: str,
             "target_duration_s": 1.5,
             "pad_with_silence_if_short": True,
         },
+    }
+
+
+def build_training_parameters(name: str) -> dict:
+    """Build an upstream-compatible baseline training configuration."""
+    return {
+        "train_dir": f"trained_models/{name}",
+        "window_step_ms": 10,
+        "clip_duration_ms": 1500,
+        "features": [
+            {
+                "features_dir": f"data/{name}/features",
+                "sampling_weight": 2.0,
+                "penalty_weight": 1.0,
+                "truth": True,
+                "truncation_strategy": "truncate_start",
+                "type": "mmap",
+            },
+            {
+                "features_dir": f"data/{name}/hard_negatives_features",
+                "sampling_weight": 3.0,
+                "penalty_weight": 5.0,
+                "truth": False,
+                "truncation_strategy": "random",
+                "type": "mmap",
+            },
+            {
+                "features_dir": "data/negative_datasets/speech",
+                "sampling_weight": 10.0,
+                "penalty_weight": 1.0,
+                "truth": False,
+                "truncation_strategy": "random",
+                "type": "mmap",
+            },
+            {
+                "features_dir": "data/negative_datasets/dinner_party",
+                "sampling_weight": 15.0,
+                "penalty_weight": 3.0,
+                "truth": False,
+                "truncation_strategy": "random",
+                "type": "mmap",
+            },
+            {
+                "features_dir": "data/negative_datasets/dinner_party_eval",
+                "sampling_weight": 0.0,
+                "penalty_weight": 1.0,
+                "truth": False,
+                "truncation_strategy": "split",
+                "type": "mmap",
+            },
+        ],
+        "training_steps": [10000],
+        "positive_class_weight": [1],
+        "negative_class_weight": [20],
+        "learning_rates": [0.001],
+        "batch_size": 128,
+        "time_mask_max_size": [0],
+        "time_mask_count": [0],
+        "freq_mask_max_size": [0],
+        "freq_mask_count": [0],
+        "eval_step_interval": 500,
+        "target_minimization": 0.5,
+        "minimization_metric": None,
+        "maximization_metric": "average_viable_recall",
     }
 
 
@@ -240,42 +357,29 @@ Bootstrapped by `scripts/init_wake.py`.
 ## Next steps
 
 ```bash
-# 1. (Optional) ask an LLM for harder collisions:
+# 1. Optionally ask an LLM for harder collisions.
 python scripts/suggest_hard_negatives.py --name {name}
 
-# 2. Synthesize positives:
-python scripts/synth_positives.py \\
-    --phrases configs/examples/{name}/wake_phrases.yaml \\
-    --out data/{name}/synth/positives \\
-    --count 10000
+# 2. Synthesize project audio.
+python scripts/synth_positives.py --project {name}
+python scripts/synth_hard_negatives.py --project {name}
 
-# 3. Synthesize hard-negatives:
-python scripts/synth_hard_negatives.py \\
-    --phrases configs/examples/{name}/hard_negatives.yaml \\
-    --out data/{name}/synth/hard_negatives \\
-    --count 2500
+# 3. Download shared negatives and build device-compatible features.
+python scripts/download_hf_negatives.py --out data/negative_datasets
+python scripts/build_features.py --project {name} --download-aug-corpora
 
-# 4. Build features + train (see PIPELINE.md):
-python scripts/build_features.py --project {name} --out data/{name}/clean
-python scripts/runpod_train.py --project {name}
+# 4. Train on an existing GPU host (or use runpod_train.py).
+python scripts/train_microwakeword.py --project {name}
 
-# 5. Eval:
-python -m eval.runner --model models/{name}-wakeword-v0.tflite
+# 5. Seed held-out tasks and evaluate.
+python scripts/seed_eval_tasks.py --project {name} --bulk-audio-dir data/raw/negatives
+python -m eval.runner --project {name} --model models/{name}-wakeword-v0.tflite
 
-# 6. Release:
-python scripts/upload_to_hf.py --project {name}
-```
-
-Or with Claude Code slash commands:
-
-```
-/wake-synth {name}
-/wake-train {name}
-/wake-eval {name}
-/wake-release {name}
+# 6. Emit an ESPHome manifest from a measured operating point.
+python scripts/emit_manifest.py --project {name} --eval-json eval/results/{name}-v0__latest.json
 ```
 """
-    out_dir.joinpath("README.md").write_text(body)
+    out_dir.joinpath("README.md").write_text(body, encoding="utf-8")
 
 
 def main() -> int:
@@ -289,6 +393,8 @@ def main() -> int:
     ap.add_argument("--weights", default=None,
                     help='Comma-separated per-phrase weights.')
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--language", choices=["en", "zh"], default=None,
+                    help="Primary sample language (auto-detected when omitted).")
     ap.add_argument("--force", action="store_true",
                     help="Overwrite an existing project directory.")
     ap.add_argument("--out-root", default="configs/examples",
@@ -331,22 +437,34 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     wake_word = split_wake_word(phrases)
+    language = args.language or detect_language(phrases)
 
-    phrases_yaml = build_phrases_yaml(name, phrases, counts, weights, args.seed)
-    hard_yaml = build_hard_negatives_yaml(name, wake_word, phrases[0], args.seed)
+    phrases_yaml = build_phrases_yaml(name, phrases, counts, weights, args.seed, language)
+    hard_yaml = build_hard_negatives_yaml(
+        name, wake_word, args.seed, language, phrases
+    )
+    training_yaml = build_training_parameters(name)
 
-    (out_dir / "wake_phrases.yaml").write_text(yaml.safe_dump(phrases_yaml, sort_keys=False))
-    (out_dir / "hard_negatives.yaml").write_text(yaml.safe_dump(hard_yaml, sort_keys=False))
+    (out_dir / "wake_phrases.yaml").write_text(
+        yaml.safe_dump(phrases_yaml, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    (out_dir / "hard_negatives.yaml").write_text(
+        yaml.safe_dump(hard_yaml, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    (out_dir / "training_parameters.yaml").write_text(
+        yaml.safe_dump(training_yaml, sort_keys=False), encoding="utf-8"
+    )
     write_project_readme(out_dir, name, phrases, wake_word)
 
     print(f"=== Initialized wake-word project '{name}' ===")
     print(f"  output:        {out_dir}/")
     print(f"  wake word:     {wake_word}")
+    print(f"  language:      {language}")
     print(f"  phrases:       {len(phrases)} → {sum(counts)} synthetic samples total")
     print(f"  rhyme rhymes:  {len(hard_yaml['buckets'][0]['phrases'])} auto-generated")
     print()
     print(f"  next: python scripts/suggest_hard_negatives.py --name {name}")
-    print(f"        (optional — uses an LLM to add non-obvious collisions)")
+    print("        (optional — uses an LLM to add non-obvious collisions)")
     return 0
 
 

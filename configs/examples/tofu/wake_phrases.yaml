@@ -6,6 +6,8 @@
 # Variations: each phrase is expanded across speeds and emotions in
 # scripts/synth_positives.py before being routed to a TTS engine.
 
+language: en
+
 phrases:
   - text: "hey tofu"
     count: 5000
@@ -29,7 +31,7 @@ phrases:
 
 # TTS variation grid — every (voice, phrase) is rendered at each speed in the
 # list. Total renders ≈ count_per_phrase × len(speeds).
-# Engines fall back from top to bottom if a voice/phrase combo fails.
+# The executable synthesis path currently uses Piper.
 variation:
   speeds: [0.85, 0.95, 1.05, 1.15]
   emotions:
@@ -42,17 +44,8 @@ variation:
 
 engines:
   - name: piper
-    weight: 0.5      # half of the dataset
-    voices: ALL      # use every Piper en-* voice
-  - name: kokoro
-    weight: 0.25
-    voices: ALL_EN   # every Kokoro English voice
-  - name: melotts
-    weight: 0.15
-    voices: [EN-US, EN-BR, EN-AU, EN-IN]
-  - name: parler
-    weight: 0.10
-    voices: [random_seed_grid_20]  # 20 random prompts via parler
+    weight: 1.0
+    voices: ALL      # LibriTTS-R generator speaker embeddings
 
 audio:
   sample_rate: 16000

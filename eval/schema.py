@@ -31,7 +31,8 @@ class EvalResult:
     passed: bool
     max_probability: float
     fire_count: int                            # number of windows above threshold
-    duration_s: float
+    duration_s: float                          # source audio duration
+    processing_time_s: float = 0.0
     error_msg: Optional[str] = None
 
 

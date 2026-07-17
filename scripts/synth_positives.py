@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Synthesize positives for a wake-word project using piper-sample-generator.
+"""Synthesize positive examples for a wake-word project with Piper.
 
-This is the canonical recipe path used by OHF-Voice/micro-wake-word's
-basic_training_notebook.ipynb. It shells out to piper-sample-generator
-(a separate repo at https://github.com/rhasspy/piper-sample-generator)
-which uses the `en_US-libritts_r-medium.pt` VITS generator model with
-**904 distinct speakers** + tempo/noise jitter for per-sample variation.
+This follows OHF-Voice/micro-wake-word's Piper recipe. English projects use
+the `en_US-libritts_r-medium.pt` generator with up to 904 speaker embeddings;
+multilingual projects use configured standard Piper ONNX voices directly via
+`piper-tts`, avoiding the PyTorch dependency of piper-sample-generator.
 
 Reads `configs/examples/<project>/wake_phrases.yaml`. For each phrase,
-runs `piper-sample-generator/generate_samples.py "<phrase>" --max-samples N`
-into `data/<project>/synth/positives/<phrase_slug>/`. Writes a unified
-`manifest.jsonl` at the end so downstream `build_features.py` knows which
-WAVs belong to which phrase.
+generates audio into `data/<project>/synth/positives/<phrase_slug>/`. Writes
+a unified `manifest.jsonl` at the end so downstream `build_features.py` knows
+which WAVs belong to which phrase.
 
 Resumable: if a phrase's directory already has the requested sample count,
 that phrase is skipped.
@@ -24,62 +22,173 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools as it
 import json
+import math
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import unicodedata
+import urllib.request
+import uuid
+import wave
 from pathlib import Path
 
 import yaml
 
 
-REPO_URL_LINUX = "https://github.com/rhasspy/piper-sample-generator"
-REPO_URL_MPS = "https://github.com/kahrendt/piper-sample-generator"
-MPS_BRANCH = "mps-support"
+REPO_URL = "https://github.com/rhasspy/piper-sample-generator"
+PSG_VERSION = "v3.0.0"
 GEN_MODEL_URL = (
     "https://github.com/rhasspy/piper-sample-generator/releases/download/"
     "v2.0.0/en_US-libritts_r-medium.pt"
 )
 GEN_MODEL_NAME = "en_US-libritts_r-medium.pt"
+PIPER_INSTALL_HINT = (
+    "Standard Piper ONNX voices require piper-tts. Install it with: "
+    'python -m pip install "piper-tts>=1.3,<2"'
+)
 
 
 def slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    normalized = unicodedata.normalize("NFKC", text).lower().strip()
+    value = re.sub(r"[^\w-]+", "_", normalized, flags=re.UNICODE).strip("_")
+    if value:
+        return value
+    import hashlib
+    return f"phrase_{hashlib.sha256(text.encode('utf-8')).hexdigest()[:10]}"
 
 
 def ensure_psg(psg_dir: Path) -> Path:
-    """Clone piper-sample-generator + download the generator model if needed.
-
-    Auto-picks the MPS-support fork on Darwin.
-    """
+    """Clone piper-sample-generator for the English `.pt` generator path."""
     if not psg_dir.exists():
-        import platform
-        if platform.system() == "Darwin":
-            print(f"  cloning {REPO_URL_MPS} (branch {MPS_BRANCH}) → {psg_dir}", flush=True)
-            subprocess.check_call([
-                "git", "clone", "-b", MPS_BRANCH, "--depth", "1",
-                REPO_URL_MPS, str(psg_dir),
-            ])
-        else:
-            print(f"  cloning {REPO_URL_LINUX} → {psg_dir}", flush=True)
-            subprocess.check_call([
-                "git", "clone", "--depth", "1", REPO_URL_LINUX, str(psg_dir),
-            ])
-
-    model_path = psg_dir / "models" / GEN_MODEL_NAME
-    if not model_path.exists():
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"  downloading generator model → {model_path}", flush=True)
+        print(f"  cloning {REPO_URL} ({PSG_VERSION}) → {psg_dir}", flush=True)
         subprocess.check_call([
-            "wget", "-q", "--show-progress", "-O", str(model_path), GEN_MODEL_URL,
+            "git", "clone", "--branch", PSG_VERSION, "--depth", "1",
+            REPO_URL, str(psg_dir),
         ])
+
     return psg_dir
+
+
+def ensure_standard_piper() -> None:
+    """Fail before downloading ONNX voices when the lightweight runtime is absent."""
+    try:
+        import piper  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(PIPER_INSTALL_HINT) from e
+
+
+def resolve_models(cfg: dict, psg_dir: Path | None,
+                   model_cache: Path = Path("data/tts_models")) -> list[Path]:
+    """Resolve configured Piper voices to local model paths.
+
+    Existing English configs use ``voices: ALL`` and fall back to the
+    LibriTTS-R generator. New multilingual configs use a list of model/config
+    URLs consumed directly by piper-tts.
+    """
+    piper = next((e for e in cfg.get("engines", []) if e.get("name") == "piper"), None)
+    if not piper:
+        raise ValueError("No implemented TTS engine found. Configure an engine named 'piper'.")
+
+    voices = piper.get("voices", "ALL")
+    if voices == "ALL":
+        if psg_dir is None:
+            raise ValueError("English generator configuration requires piper-sample-generator")
+        model_path = psg_dir / "models" / GEN_MODEL_NAME
+        if not model_path.exists():
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"  downloading English generator model → {model_path}", flush=True)
+            urllib.request.urlretrieve(GEN_MODEL_URL, model_path)
+        return [model_path]
+    if not isinstance(voices, list) or not voices:
+        raise ValueError("piper voices must be 'ALL' or a non-empty list")
+    models: list[Path] = []
+    model_cache.mkdir(parents=True, exist_ok=True)
+    for voice in voices:
+        if not isinstance(voice, dict):
+            raise ValueError("standard Piper voices must provide id, model_url and config_url")
+        voice_id = slug(str(voice.get("id", "voice")))
+        model_url = voice.get("model_url")
+        config_url = voice.get("config_url")
+        if not model_url or not config_url:
+            raise ValueError(f"Piper voice {voice_id!r} is missing model_url/config_url")
+        suffix = Path(str(model_url).split("?", 1)[0]).suffix or ".onnx"
+        if suffix.lower() != ".onnx":
+            raise ValueError(f"Piper voice {voice_id!r} model_url must point to an .onnx file")
+        model_path = model_cache / f"{voice_id}{suffix}"
+        config_path = Path(f"{model_path}.json")
+        for url, dest in ((model_url, model_path), (config_url, config_path)):
+            if not dest.exists():
+                print(f"  downloading {voice_id} → {dest}", flush=True)
+                urllib.request.urlretrieve(url, dest)
+        models.append(model_path)
+    return models
+
+
+def generate_standard_piper_samples(phrase: str, output_dir: Path, count: int,
+                                    models: list[Path],
+                                    length_scales: list[float] | None,
+                                    max_speakers: int | None) -> None:
+    """Generate ONNX Piper samples without importing PyTorch."""
+    try:
+        from piper import PiperVoice, SynthesisConfig
+    except ImportError as e:
+        raise RuntimeError(PIPER_INSTALL_HINT) from e
+
+    voices = [PiperVoice.load(str(model), use_cuda=False) for model in models]
+    scales = length_scales or [0.85, 1.0, 1.15]
+    settings = it.cycle(it.product(
+        voices, scales, [0.55, 0.667, 0.8], [0.65, 0.8, 0.95]
+    ))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        voice, length_scale, noise_scale, noise_w_scale = next(settings)
+        num_speakers = voice.config.num_speakers
+        if max_speakers is not None:
+            num_speakers = min(num_speakers, max_speakers)
+        speaker_id = index % max(1, num_speakers)
+        with wave.open(str(output_dir / f"{index:07d}.wav"), "wb") as wav_file:
+            voice.synthesize_wav(
+                phrase,
+                wav_file=wav_file,
+                syn_config=SynthesisConfig(
+                    speaker_id=speaker_id,
+                    length_scale=length_scale,
+                    noise_scale=noise_scale,
+                    noise_w_scale=noise_w_scale,
+                ),
+            )
+
+
+def build_generator_command(psg_dir: Path, phrase: str, out_dir: Path,
+                            count: int, batch_size: int, models: list[Path],
+                            max_speakers: int | None,
+                            length_scales: list[float] | None) -> tuple[list[str], str | None]:
+    """Build the piper-sample-generator v3 command for an English `.pt` model."""
+    if any(m.suffix != ".pt" for m in models):
+        raise RuntimeError("build_generator_command is only used for `.pt` generator models")
+    cmd = [
+        sys.executable, str((psg_dir / "generate_samples.py").resolve()), phrase,
+        "--max-samples", str(count), "--batch-size", str(batch_size),
+        "--output-dir", str(out_dir.resolve()),
+        "--model", str(models[0].resolve()),
+    ]
+    if max_speakers is not None:
+        cmd.extend(["--max-speakers", str(max_speakers)])
+    if length_scales:
+        cmd.append("--length-scales")
+        cmd.extend(str(scale) for scale in length_scales)
+    return cmd, None
 
 
 def generate_for_phrase(psg_dir: Path, phrase: str, out_dir: Path,
                         count: int, batch_size: int = 100,
                         max_speakers: int | None = 904,
+                        models: list[Path] | None = None,
+                        length_scales: list[float] | None = None,
                         *, max_retries: int = 3,
                         min_ratio: float = 0.95,
                         retry_sleep_s: float = 10.0,
@@ -101,21 +210,42 @@ def generate_for_phrase(psg_dir: Path, phrase: str, out_dir: Path,
     needed = count - len(existing)
     print(f"  → {phrase}: generating {needed} more ({len(existing)} already on disk)", flush=True)
 
-    cmd = [
-        sys.executable, str(psg_dir / "generate_samples.py"),
-        phrase,
-        "--max-samples", str(needed),
-        "--batch-size", str(batch_size),
-        "--output-dir", str(out_dir),
-    ]
-    if max_speakers is not None:
-        cmd.extend(["--max-speakers", str(max_speakers)])
+    models = models or [psg_dir / "models" / GEN_MODEL_NAME]
+    standard_onnx = all(model.suffix == ".onnx" for model in models)
 
     for attempt in range(1, max_retries + 1):
-        try:
-            subprocess.check_call(cmd)
+        actual_before = len(list(out_dir.glob("*.wav")))
+        remaining = count - actual_before
+        if remaining <= 0:
             break
-        except subprocess.CalledProcessError as e:
+        error: Exception | None = None
+        with tempfile.TemporaryDirectory(prefix=".pending-", dir=out_dir) as pending:
+            pending_dir = Path(pending)
+            try:
+                if standard_onnx:
+                    generate_standard_piper_samples(
+                        phrase, pending_dir, remaining, models,
+                        length_scales, max_speakers,
+                    )
+                else:
+                    cmd, cwd = build_generator_command(
+                        psg_dir, phrase, pending_dir, remaining, batch_size,
+                        models, max_speakers, length_scales,
+                    )
+                    subprocess.check_call(cmd, cwd=cwd)
+            except Exception as e:  # preserve any WAVs completed before failure
+                error = e
+            for wav in pending_dir.glob("*.wav"):
+                wav.replace(out_dir / f"{uuid.uuid4().hex}.wav")
+
+        if error is None:
+            break
+
+        e = error
+        if isinstance(e, RuntimeError) and "require piper-tts" in str(e):
+            print(f"  ✗ {phrase}: {e}", file=sys.stderr, flush=True)
+            break
+        else:
             actual = len(list(out_dir.glob("*.wav")))
             if attempt >= max_retries:
                 print(
@@ -130,20 +260,14 @@ def generate_for_phrase(psg_dir: Path, phrase: str, out_dir: Path,
                 file=sys.stderr, flush=True,
             )
             time.sleep(retry_sleep_s)
-            new_needed = count - actual
-            if new_needed <= 0:
-                break
-            for i, tok in enumerate(cmd):
-                if tok == "--max-samples":
-                    cmd[i + 1] = str(new_needed)
-                    break
 
     actual = len(list(out_dir.glob("*.wav")))
-    ok = actual >= int(count * min_ratio)
+    ok = actual >= max(1, math.ceil(count * min_ratio))
     return actual, ok
 
 
-def write_manifest(positives_root: Path, by_phrase: dict[str, Path]) -> None:
+def write_manifest(positives_root: Path, by_phrase: dict[str, Path],
+                   models: list[Path]) -> None:
     """Write a single manifest.jsonl for downstream feature extraction."""
     mfp = positives_root / "manifest.jsonl"
     n = 0
@@ -155,8 +279,11 @@ def write_manifest(positives_root: Path, by_phrase: dict[str, Path]) -> None:
                     "wav_path": str(wav),
                     "phrase": phrase,
                     "label": "positive",
-                    "engine": "piper_sample_generator",
-                    "voice_model": GEN_MODEL_NAME,
+                    "engine": (
+                        "piper" if all(model.suffix == ".onnx" for model in models)
+                        else "piper_sample_generator"
+                    ),
+                    "voice_model": ",".join(model.name for model in models),
                 }) + "\n")
                 n += 1
     print(f"  wrote {mfp} ({n} rows)", flush=True)
@@ -176,7 +303,9 @@ def main() -> int:
     ap.add_argument("--max-speakers", type=int, default=904,
                     help="Cap on Piper voice speaker count (default 904 = LibriTTS-R full).")
     ap.add_argument("--psg-dir", default="piper-sample-generator",
-                    help="Where to clone piper-sample-generator (default ./piper-sample-generator)")
+                    help="English generator checkout (not used for ONNX voices).")
+    ap.add_argument("--model-cache", default="data/tts_models",
+                    help="Cache directory for standard Piper ONNX voices.")
     args = ap.parse_args()
 
     cfg_path = Path(args.config) if args.config else Path(
@@ -204,7 +333,23 @@ def main() -> int:
     print(f"  speakers: {args.max_speakers}")
     print(flush=True)
 
-    psg_dir = ensure_psg(Path(args.psg_dir))
+    piper_cfg = next((e for e in cfg.get("engines", []) if e.get("name") == "piper"), {})
+    uses_english_generator = piper_cfg.get("voices", "ALL") == "ALL"
+    try:
+        if not uses_english_generator:
+            ensure_standard_piper()
+        psg_dir = (
+            ensure_psg(Path(args.psg_dir))
+            if uses_english_generator else Path(args.psg_dir)
+        )
+        models = resolve_models(
+            cfg, psg_dir if uses_english_generator else None, Path(args.model_cache)
+        )
+    except (OSError, ValueError, RuntimeError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    print(f"  models:   {', '.join(m.name for m in models)}", flush=True)
+    length_scales = [float(v) for v in cfg.get("variation", {}).get("speeds", [])]
 
     by_phrase: dict[str, Path] = {}
     shortfalls: list[tuple[str, int, int]] = []
@@ -213,7 +358,9 @@ def main() -> int:
         by_phrase[phrase] = phrase_dir
         actual, ok = generate_for_phrase(psg_dir, phrase, phrase_dir, count,
                                          batch_size=args.batch_size,
-                                         max_speakers=args.max_speakers)
+                                         max_speakers=args.max_speakers,
+                                         models=models,
+                                         length_scales=length_scales)
         if not ok:
             shortfalls.append((phrase, actual, count))
 
@@ -228,7 +375,7 @@ def main() -> int:
               "(see RUNPOD_RECIPE.md).", file=sys.stderr)
         return 1
 
-    write_manifest(out_root, by_phrase)
+    write_manifest(out_root, by_phrase, models)
 
     total = sum(len(list(d.glob("*.wav"))) for d in by_phrase.values())
     print(f"\n=== done: {total} positive WAVs across {len(by_phrase)} phrases ===", flush=True)

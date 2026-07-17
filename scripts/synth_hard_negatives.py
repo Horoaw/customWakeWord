@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -27,7 +26,11 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from synth_positives import (  # noqa: E402  — sibling import
-    ensure_psg, generate_for_phrase, slug, GEN_MODEL_NAME,
+    ensure_psg,
+    ensure_standard_piper,
+    generate_for_phrase,
+    resolve_models,
+    slug,
 )
 
 
@@ -42,7 +45,10 @@ def main() -> int:
                     help="Override total hard-neg count (default: sum of bucket target_counts)")
     ap.add_argument("--batch-size", type=int, default=100)
     ap.add_argument("--max-speakers", type=int, default=904)
-    ap.add_argument("--psg-dir", default="piper-sample-generator")
+    ap.add_argument("--psg-dir", default="piper-sample-generator",
+                    help="English generator checkout (not used for ONNX voices).")
+    ap.add_argument("--model-cache", default="data/tts_models",
+                    help="Cache directory for standard Piper ONNX voices.")
     args = ap.parse_args()
 
     cfg_path = Path(args.config) if args.config else Path(
@@ -64,7 +70,23 @@ def main() -> int:
     print(f"  out:      {out_root}")
     print(flush=True)
 
-    psg_dir = ensure_psg(Path(args.psg_dir))
+    piper_cfg = next((e for e in cfg.get("engines", []) if e.get("name") == "piper"), {})
+    uses_english_generator = piper_cfg.get("voices", "ALL") == "ALL"
+    try:
+        if not uses_english_generator:
+            ensure_standard_piper()
+        psg_dir = (
+            ensure_psg(Path(args.psg_dir))
+            if uses_english_generator else Path(args.psg_dir)
+        )
+        models = resolve_models(
+            cfg, psg_dir if uses_english_generator else None, Path(args.model_cache)
+        )
+    except (OSError, ValueError, RuntimeError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    print(f"  models:   {', '.join(m.name for m in models)}", flush=True)
+    length_scales = [float(v) for v in cfg.get("variation", {}).get("speeds", [])]
 
     manifest_rows: list[dict] = []
     shortfalls: list[tuple[str, str, int, int]] = []
@@ -81,7 +103,9 @@ def main() -> int:
             phrase_dir = out_root / f"{bid}__{slug(phrase)}"
             actual, ok = generate_for_phrase(psg_dir, phrase, phrase_dir, per_phrase,
                                              batch_size=args.batch_size,
-                                             max_speakers=args.max_speakers)
+                                             max_speakers=args.max_speakers,
+                                             models=models,
+                                             length_scales=length_scales)
             if not ok:
                 shortfalls.append((bid, phrase, actual, per_phrase))
             for wav in sorted(phrase_dir.glob("*.wav")):
@@ -91,8 +115,11 @@ def main() -> int:
                     "phrase": phrase,
                     "bucket_id": bid,
                     "label": "hard_negative",
-                    "engine": "piper_sample_generator",
-                    "voice_model": GEN_MODEL_NAME,
+                    "engine": (
+                        "piper" if all(model.suffix == ".onnx" for model in models)
+                        else "piper_sample_generator"
+                    ),
+                    "voice_model": ",".join(m.name for m in models),
                 })
 
     if shortfalls:

@@ -1,6 +1,6 @@
-# Template for an ESPHome wake-word device using the tofu-wakeword-v0 model.
-# scripts/export_tflite.py fills in the {{model_url}} and {{probability_cutoff}}
-# placeholders from the eval results and the HF Hub upload destination.
+# Template for an ESPHome wake-word device using an evaluated model manifest.
+# `manifest_url` must point to the JSON written by scripts/emit_manifest.py,
+# published next to its referenced .tflite file.
 
 esphome:
   name: tofu
@@ -36,10 +36,7 @@ micro_wake_word:
   microphone: tofu_mic
   vad:
   models:
-    - model: hey_tofu
-      probability_cutoff: {{probability_cutoff}}
-      sliding_window_size: 5
-      url: {{model_url}}
+    - model: "{{manifest_url}}"
   on_wake_word_detected:
     - logger.log:
         format: "wake word detected: %s"
@@ -50,6 +47,7 @@ logger:
 
 api:
 ota:
+  - platform: esphome
 
 wifi:
   ssid: !secret wifi_ssid

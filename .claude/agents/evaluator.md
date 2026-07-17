@@ -25,7 +25,8 @@ If `eval/tasks/<slug>/` is empty or doesn't exist:
 python scripts/seed_eval_tasks.py --project <slug> --positives 50 --hard-negatives 50
 ```
 
-This samples from the held-out test split in `data/<slug>/clean/meta.json["test_ids"]`.
+This samples the deterministic testing partition directly from the synthesis
+manifests. Pass `--bulk-audio-dir` with held-out raw audio for FAR/hour.
 
 ### 3. Run the scorer
 

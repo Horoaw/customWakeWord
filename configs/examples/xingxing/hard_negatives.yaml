@@ -1,0 +1,74 @@
+project_name: xingxing
+wake_name: 星星
+language: zh
+buckets:
+- id: rhyme_collisions
+  target_count: 600
+  notes: Phonetic neighbors of '星星'. Edit freely.
+  phrases:
+  - 醒醒
+  - 新星
+  - 行星
+  - 信心
+  - 欣欣
+  - 晶晶
+  - 静静
+  - 清醒
+- id: greeting_no_wake
+  target_count: 300
+  notes: Greetings that don't address the wake word.
+  phrases:
+  - 你好
+  - 嗨
+  - 您好
+  - 早上好
+  - 晚上好
+- id: wake_no_greeting
+  target_count: 500
+  notes: Context containing '星星' that should not fire.
+  phrases:
+  - 我刚才说了星星
+  - 你听见星星了吗
+  - 电视里提到了星星
+- id: contextual_use
+  target_count: 300
+  notes: '''星星'' used in normal speech.'
+  phrases:
+  - 我喜欢星星
+  - 我们来聊聊星星
+  - 那个星星在哪里
+  - 星星真的很好
+- id: near_match_words
+  target_count: 200
+  notes: Similar rhythm or partial overlap; extend with real misfires.
+  phrases:
+  - 心心
+  - 轻轻
+  - 听清
+  - 星辰
+  - 星球
+  - 星光
+engines:
+- name: piper
+  weight: 1.0
+  voices:
+  - id: zh_CN-xiao_ya-medium
+    model_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/xiao_ya/medium/zh_CN-xiao_ya-medium.onnx
+    config_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/xiao_ya/medium/zh_CN-xiao_ya-medium.onnx.json
+  - id: zh_CN-huayan-x_low
+    model_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/x_low/zh_CN-huayan-x_low.onnx
+    config_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/x_low/zh_CN-huayan-x_low.onnx.json
+variation:
+  speeds:
+  - 0.85
+  - 0.95
+  - 1.05
+  - 1.15
+  random_seed: 4242
+audio:
+  sample_rate: 16000
+  channels: 1
+  format: wav
+  trim_silence: true
+  target_duration_s: 1.5
+  pad_with_silence_if_short: true

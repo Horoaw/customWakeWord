@@ -11,6 +11,8 @@
 # Each phrase entry is sampled at training time. The `count` field is the
 # absolute target after de-duplication; `weight` reweights loss per-sample.
 
+language: en
+
 phrases:
   - text: "hey"
     count: 4000
@@ -42,17 +44,8 @@ variation:
 
 engines:
   - name: piper
-    weight: 0.5
+    weight: 1.0
     voices: ALL
-  - name: kokoro
-    weight: 0.25
-    voices: ALL_EN
-  - name: melotts
-    weight: 0.15
-    voices: [EN-US, EN-BR, EN-AU, EN-IN]
-  - name: parler
-    weight: 0.10
-    voices: [random_seed_grid_20]
 
 audio:
   sample_rate: 16000

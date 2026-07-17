@@ -1,227 +1,311 @@
 # customWakeWord
 
-> A repeatable, agent-driven pipeline for training **any custom wake word** end-to-end — from a single user-supplied phrase to a deployable INT8 TFLite Micro model on **ESP32-S3**. Synthesize the data, train the model, eval against adversarial collisions, and ship to HuggingFace + ESPHome — with one slash command per stage.
+Training toolkit for producing custom INT8 microWakeWord models for
+**ESP32-S3 devices running ESPHome**.
 
-Give it a phrase. It gives you a wake-word model.
+The repository implements project configuration, Piper sample generation,
+MicroFrontend-compatible feature extraction, upstream microWakeWord training,
+held-out streaming evaluation, ESPHome manifest generation, and Hugging Face
+upload helpers.
 
-> ⚠ **Firmware compatibility.** Our output is an INT8 `.tflite` for
-> ESPHome's `micro_wake_word`. It does **not** load on XiaoZhi,
-> ESP-S3-BOX-3 stock firmware, or anything else built on Espressif's
-> `esp-sr` — those expect a `wn9_*.bin` WakeNet model in a proprietary
-> format with no public converter. See
-> [`RELEASE_PROTOCOL.md`](RELEASE_PROTOCOL.md) for the full target matrix
-> and the five paths to producing an ESP-SR companion model.
+For a current comparison of ready-made models, turnkey trainers, this training
+pipeline, and Espressif WakeNet, see
+[`ESP32_S3_OPTIONS_ZH.md`](ESP32_S3_OPTIONS_ZH.md) (Chinese).
 
-```
-python scripts/init_wake.py --name sunny --phrases "hey sunny,hi sunny,okay sunny"
-/wake-synth sunny       # synthesize ~12k positives + ~2.5k hard-negatives via TTS
-/wake-train sunny       # train microWakeWord on RunPod
-/wake-eval sunny        # FRR + FAR/hour against held-out tasks
-/wake-release sunny     # push to HuggingFace Hub + emit ESPHome YAML
-```
+It is a training toolkit, not a collection of ready-made models. This checkout
+does not contain trained `.tflite` artifacts or a quality guarantee for an
+arbitrary phrase.
 
-That's the whole flow. Each slash command is a Claude Code agent that orchestrates the underlying Python scripts; the scripts run independently as a plain CLI if you don't use Claude Code.
+> **Firmware compatibility:** output is an INT8 `.tflite` for ESPHome's
+> `micro_wake_word`. It does not load on XiaoZhi, ESP-S3-BOX stock firmware, or
+> firmware based on Espressif ESP-SR/WakeNet. Those systems expect a proprietary
+> `wn9_*.bin` model.
 
----
+## Quick start: personal GPU server
 
-## What it is
-
-A toolkit that bundles:
-
-1. **A TTS data-synthesis pipeline** that pulls from four permissive open-source engines (Piper, Kokoro, MeloTTS, Parler-TTS) for ~200 distinct voices, accents, and prosody settings — all free, all local-CPU.
-
-2. **An LLM-assisted hard-negative generator** that takes your wake phrase and proposes likely false-fire collisions (`scripts/suggest_hard_negatives.py`). You can also hand-author the collision list.
-
-3. **A standard audiomentations chain** (RIR convolution + additive noise from MUSAN/DEMAND + codec degradation + pitch/speed jitter) so the model survives cheap MEMS mics and noisy rooms.
-
-4. **A [microWakeWord](https://github.com/kahrendt/microWakeWord)-based training loop** that produces an INT8 `.tflite` <100 kB, <10 ms inference on ESP32-S3, runnable via [ESPHome](https://esphome.io/components/micro_wake_word/) with a single YAML stanza.
-
-5. **A held-out eval harness** with concrete operating-point metrics (FRR ≤ 5%, FAR ≤ 1/hour) so you can ship vs. iterate with a clear signal.
-
-6. **A `.claude/` agent layer** (CLAUDE.md + agents + slash commands) so the whole pipeline runs from natural language inside Claude Code — RunPod provisioning, polling, model card generation, HF Hub upload all driven by agents.
-
----
-
-## Pipeline at a glance
-
-```
-  $ python scripts/init_wake.py --name <slug> --phrases "<phrase1>,<phrase2>,…"
-  configs/examples/<slug>/{wake_phrases,hard_negatives}.yaml
-        │
-        ▼   Piper + Kokoro + MeloTTS + Parler-TTS
-  data/<slug>/synth/positives/         (~10k WAV)
-        │
-        ▼   adversarial: from LLM (scripts/suggest_hard_negatives.py) + hand
-  data/<slug>/synth/hard_negatives/    (~2.5k WAV)
-        │
-        ▼   bulk: MUSAN + DEMAND + Common Voice + AudioSet
-  data/raw/negatives/                  (~300 h, shared across projects)
-        │
-        ▼   audiomentations: RIR + noise + codec + EQ + pitch/speed
-  data/<slug>/clean/{train,val,test}.tfrecord
-        │
-        ▼   microWakeWord (TF/Keras, INT8 QAT/PTQ)
-        │   on RunPod A40, ~$0.40, target ~1 h
-  models/<slug>-wakeword-v0.tflite  (<100 kB INT8 for ESP32-S3)
-        │
-        ▼   eval/runner.py — FRR on positives, FAR/hour on bulk audio
-  eval/results/<slug>-v0__<ts>.json
-        │
-        ▼   HuggingFace Hub + ESPHome YAML snippet + GitHub Release
-```
-
-See [`PIPELINE.md`](PIPELINE.md) for the exact commands and [`RESEARCH.md`](RESEARCH.md) for the literature/model survey that informs every choice.
-
----
-
-## Quick start — the worked example
-
-**[Tofu](configs/examples/tofu/)** is the example wake word that ships with this repo: a robotic toy that wakes on "hey tofu" / "hi tofu" / "hello tofu" / "okay tofu". See [`PLAN.md`](PLAN.md) for the v0 numbers (10k positives, 2.5k hard-negs, 300 h bulk, FRR ≤ 5% / FAR ≤ 1/hr targets).
+The recommended path is the Docker launcher on a Linux server with an NVIDIA
+GPU. The host only needs Docker, an NVIDIA driver, and NVIDIA Container
+Toolkit; Python 3.10, TensorFlow, microWakeWord, Piper, and `ffmpeg` are provided
+by the training image.
 
 ```bash
-git clone https://github.com/temm1e-labs/customWakeWord && cd customWakeWord
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/Horoaw/customWakeWord.git
+cd customWakeWord
 
-# credentials (place in ~/.config/tofu-wake/{hf,gh,together,runpod}.env, chmod 600)
-source scripts/load_creds.sh
-
-# 1. Synthesize Tofu positives (~30 min on Mac CPU)
-python scripts/synth_positives.py \
-    --phrases configs/examples/tofu/wake_phrases.yaml \
-    --out data/tofu/synth/positives \
-    --count 10000
-
-# 2. Synthesize hard negatives (~5 min)
-python scripts/synth_hard_negatives.py \
-    --phrases configs/examples/tofu/hard_negatives.yaml \
-    --out data/tofu/synth/hard_negatives \
-    --count 2500
-
-# 3. Bulk negatives (~30 GB, ~1 h)
-python scripts/collect_negatives.py --out data/raw/negatives
-
-# 4. Augment + build train/val/test splits
-python scripts/build_features.py --project tofu --out data/tofu/clean
-
-# 5. Train on RunPod (~$0.40, ~1 h)
-python scripts/runpod_train.py --project tofu
-
-# 6. Eval
-python -m eval.runner --project tofu \
-    --model models/tofu-wakeword-v0.tflite \
-    --out eval/results/tofu-v0__$(date +%s).json
-
-# 7. Publish
-python scripts/upload_to_hf.py --project tofu \
-    --repo-id <you>/tofu-wakeword-v0
+# Default project: xingxing; default wake phrase: 星星
+bash scripts/train_local_server.sh
 ```
 
----
-
-## Quick start — your own wake word
+The wake phrase is configured near the top of
+[`scripts/train_local_server.sh`](scripts/train_local_server.sh):
 
 ```bash
-# 1. Bootstrap a fresh project. Generates configs/examples/<name>/{wake_phrases,hard_negatives}.yaml
-python scripts/init_wake.py --name sunny \
-    --phrases "hey sunny,hi sunny,hello sunny,okay sunny"
-
-# 2. (Recommended) ask an LLM for harder, less-obvious collisions:
-python scripts/suggest_hard_negatives.py --name sunny
-
-# 3-7. Follow the Tofu example above with `--project sunny` everywhere.
+PROJECT_NAME="${PROJECT_NAME:-xingxing}"
+WAKE_PHRASES="${WAKE_PHRASES:-星星}"
+LANGUAGE="${LANGUAGE:-zh}"
 ```
 
-With Claude Code, the whole flow is:
+You can also override the settings without editing the file:
 
-```
-/wake-new sunny "hey sunny,hi sunny,hello sunny,okay sunny"
-/wake-synth sunny
-/wake-train sunny
-/wake-eval sunny
-/wake-release sunny
-```
-
-The agents in `.claude/agents/` handle credentials, RunPod polling, model card generation, and ESPHome YAML emission. See [`CLAUDE.md`](CLAUDE.md) for the agent contract.
-
----
-
-## Repository contents
-
-```
-customWakeWord/
-├── README.md                   ← this file
-├── CLAUDE.md                   ← entry point for Claude Code agents
-├── PIPELINE.md                 ← exact technical recipe (generic)
-├── RESEARCH.md                 ← wake-word literature + model survey
-├── PLAN.md                     ← v0 plan numbers for the Tofu example
-├── EXAMPLES.md                 ← Tofu, sunny, jarvis worked examples
-├── REPLICATE.md                ← step-by-step end-to-end replication
-├── BUDGET_LOG.md               ← line-by-line compute spend tracker
-├── LICENSE                     ← Apache 2.0
-│
-├── configs/
-│   ├── templates/              ← wake_template.yaml + hard_negatives_template.yaml
-│   ├── examples/
-│   │   └── tofu/               ← worked example: phrases.yaml + hard_negatives.yaml + README
-│   ├── data.yaml               ← shared augmentation chain config
-│   ├── train.yaml              ← shared microWakeWord training hyperparams
-│   └── templates/esphome_template.yaml
-│
-├── data/                       ← (gitignored) per-project + shared corpora
-│   ├── <project>/synth/        ← project-specific TTS outputs
-│   ├── <project>/clean/        ← project-specific TFRecord splits
-│   └── raw/negatives/          ← MUSAN/DEMAND/CV/AudioSet (shared across projects)
-│
-├── eval/
-│   ├── tasks/<project>/        ← per-project held-out tasks
-│   ├── runner.py               ← FRR + FAR/hour scorer for .tflite
-│   ├── schema.py               ← EvalTask + EvalResult dataclasses
-│   └── results/                ← per-project JSON eval outputs
-│
-├── scripts/
-│   ├── load_creds.sh           ← source HF/GH/Together/RunPod tokens
-│   ├── init_wake.py            ← bootstrap a new wake-word project from a phrase
-│   ├── suggest_hard_negatives.py ← LLM-driven adversarial generator
-│   ├── synth_positives.py      ← Piper + Kokoro + MeloTTS + Parler-TTS
-│   ├── synth_hard_negatives.py ← same engines, adversarial phrases
-│   ├── collect_negatives.py    ← MUSAN/CV/DEMAND/AudioSet downloader
-│   ├── augment.py              ← shared augmentation chain (module, not CLI)
-│   ├── build_features.py       ← WAV → 40-mel → TFRecord splits
-│   ├── train_microwakeword.py  ← TF/Keras training loop wrapper
-│   ├── runpod_train.py         ← RunPod A40 launcher with log server
-│   ├── export_tflite.py        ← INT8 PTQ + TFLite Micro export for ESP32-S3
-│   ├── upload_to_hf.py         ← model + ESPHome YAML → HuggingFace Hub
-│   └── seed_eval_tasks.py      ← hand-curate held-out test set from TFRecord
-│
-├── models/                     ← trained .tflite checkpoints (gitignored)
-└── .claude/
-    ├── agents/                 ← data-synthesizer, trainer, evaluator, release-manager
-    └── commands/               ← /wake-new, /wake-synth, /wake-train, /wake-eval, /wake-release, /wake-status
+```bash
+PROJECT_NAME=nihao_xingxing \
+WAKE_PHRASES="你好星星" \
+LANGUAGE=zh \
+bash scripts/train_local_server.sh
 ```
 
----
+Use a new `PROJECT_NAME` whenever the wake phrase changes. The launcher checks
+existing YAML before training and refuses to mix old audio/features with a new
+phrase. Completed synthesis and feature stages are reused on subsequent runs.
 
-## Why microWakeWord (and when to switch)
+The full run performs:
 
-For **MCU-class deployments** (ESP32-S3, ESP-IDF, ESPHome), microWakeWord is the default and the only mature option in 2025–26. INT8 TFLite Micro, <10 ms streaming inference, <100 kB on disk, ships in Home Assistant Voice PE.
+1. GPU/container and TensorFlow preflight checks.
+2. Wake-word project initialization.
+3. Positive and hard-negative Piper synthesis.
+4. Public Hugging Face negative-feature download.
+5. MicroFrontend feature generation and MixedNet training.
+6. INT8 streaming TFLite export.
+7. Optional held-out evaluation and ESPHome manifest generation.
 
-If your wake-word needs to run on a **Raspberry Pi-class SBC**, swap in [openWakeWord](https://github.com/dscripka/openWakeWord) — the data pipeline above feeds it identically; only `scripts/train_microwakeword.py` and `scripts/export_tflite.py` change. We've left the openWakeWord head untrained in v0 to keep the surface focused; see [`RESEARCH.md`](RESEARCH.md) for the comparison.
+Primary outputs:
 
-If your wake-word needs to run on a **microcontroller smaller than ESP32-S3** (Cortex-M4, etc.), microWakeWord's published model size may still fit but Picovoice Porcupine has stronger production support — note its [free-tier limits](https://picovoice.ai/pricing/) before shipping commercially.
+```text
+models/<project>-wakeword-v0.tflite
+trained_models/<project>-v0/
+configs/examples/<project>/manifest.json   # only after threshold/evaluation
+```
 
----
+Public model/data downloads do not normally require `HF_TOKEN`. If the
+pre-built image is unavailable or you prefer to build it on the server:
+
+```bash
+docker build -t customwake-deps:local .
+TRAIN_IMAGE=customwake-deps:local bash scripts/train_local_server.sh
+```
+
+## Implemented
+
+- Unicode-safe project initialization for English and Mandarin projects.
+- Baseline `training_parameters.yaml` generation for every new project.
+- Piper synthesis:
+  - English LibriTTS-R generation through Piper Sample Generator v3, with up
+    to 904 speaker embeddings.
+  - Configurable standard Piper ONNX voices through lightweight `piper-tts`,
+    including Mandarin defaults.
+- LLM-assisted and hand-editable hard-negative phrase lists.
+- Upstream microWakeWord augmentation, MicroFrontend features, RaggedMmap
+  datasets, MixedNet training, and streaming INT8 export.
+- Held-out evaluation using the same `pymicro_features` frontend and streaming
+  input shape used by the deployed model.
+- FRR, hard-negative bucket FAR, and FAR/hour from measured bulk-audio duration.
+- ESPHome v2 manifest and Hugging Face model-card generation.
+- Personal-server Docker launcher plus RunPod and Lambda launch helpers.
+
+## Not automatic
+
+- A generated model is not necessarily usable. Reliable wake words normally
+  require real recordings, deployment-specific negatives, threshold tuning,
+  and repeated device tests.
+- Kokoro, MeloTTS, and Parler-TTS are research options only; the executable
+  synthesis path currently uses Piper.
+- The repository does not produce ESP-SR/WakeNet `.bin` models.
+- Raspberry Pi/openWakeWord training is not implemented.
+- RunPod training cannot create a trustworthy release unless held-out eval
+  audio is made available separately. Without eval tasks it exports the model
+  and intentionally skips the manifest and upload.
+
+## Manual environment requirements
+
+- Python 3.10 for the pinned training environment.
+- Linux with an NVIDIA GPU for full training. CPU can run initialization,
+  small synthesis checks, and evaluation.
+- `git`, `ffmpeg`, and enough disk for generated audio and negative datasets.
+- Approximately 10 GB for the default precomputed negative feature datasets,
+  plus generated samples and augmentation corpora.
+
+These requirements apply when running the Python stages manually instead of
+using `scripts/train_local_server.sh`. The Dockerfile contains the reproducible
+GPU dependency environment.
+For a local Mandarin synthesis smoke test, the full GPU stack is unnecessary:
+
+```bash
+python -m pip install "piper-tts>=1.3,<2" pyyaml
+```
+
+## Mandarin example: 星星
+
+`星星` is a short everyday phrase with high-risk collisions such as `猩猩`,
+`醒醒`, `行星`, `新星`, `小星星`, and ordinary sentences containing the word.
+Review the generated negatives before spending GPU time. An exact homophone
+cannot be reliably separated using acoustics alone; a longer phrase such as
+`你好星星` is normally easier to deploy.
+
+```bash
+# 1. A reviewed baseline already exists at configs/examples/xingxing.
+# To create a separate variant instead:
+python scripts/init_wake.py --name my_xingxing --phrases "星星" --language zh
+
+# 2. Review the included collision list, then synthesize audio.
+python -m pip install "piper-tts>=1.3,<2" pyyaml
+python scripts/synth_positives.py --project xingxing
+python scripts/synth_hard_negatives.py --project xingxing
+
+# 3. Download shared negative features and build project features.
+python scripts/download_hf_negatives.py --out data/negative_datasets
+python scripts/build_features.py --project xingxing --download-aug-corpora
+
+# 4. Train on a configured GPU host.
+python scripts/train_microwakeword.py --project xingxing
+```
+
+The Mandarin config downloads two standard Piper ONNX voices into
+`data/tts_models` on first use. It does not need the English LibriTTS-R `.pt`
+generator or PyTorch. Add more
+properly licensed Mandarin voices and real recordings for speaker diversity.
+The default bulk speech negatives are English-heavy, so Mandarin deployment
+also requires held-out Mandarin conversation, television, music, and room
+audio.
+
+## English example
+
+```bash
+python scripts/init_wake.py \
+  --name sunny \
+  --phrases "hey sunny,hi sunny,hello sunny,okay sunny" \
+  --language en
+
+python scripts/synth_positives.py --project sunny
+python scripts/synth_hard_negatives.py --project sunny
+python scripts/download_hf_negatives.py --out data/negative_datasets
+python scripts/build_features.py --project sunny --download-aug-corpora
+python scripts/train_microwakeword.py --project sunny
+```
+
+Existing worked configurations are under `configs/examples/xingxing`,
+`configs/examples/tofu`, and `configs/examples/greet`.
+
+## Held-out evaluation
+
+Do not evaluate only on TTS samples used to build training features. Add raw,
+held-out negative audio under `data/raw/negatives` or pass another directory.
+Real recordings from the target microphones should be added as task JSON files
+under `eval/tasks/<project>/positives`.
+
+```bash
+python scripts/seed_eval_tasks.py \
+  --project xingxing \
+  --positives 100 \
+  --hard-negatives 200 \
+  --bulk-audio-dir data/raw/negatives \
+  --bulk-stream-minutes 60
+
+python -m eval.runner \
+  --project xingxing \
+  --model models/xingxing-wakeword-v0.tflite \
+  --threshold 0.85 \
+  --out eval/results/xingxing-v0__latest.json
+```
+
+Run evaluation at several thresholds and select an operating point appropriate
+for the device. Initial targets are typically FRR <= 5% and FAR <= 1/hour, but
+short common phrases may not reach both targets.
+
+The evaluator:
+
+1. Resamples input to mono 16 kHz.
+2. Runs the C MicroFrontend from `pymicro_features`.
+3. Feeds the model's streaming input slices in order.
+4. Resets model state between tasks.
+5. Applies the configured sliding probability window.
+6. Uses actual bulk-audio duration for FAR/hour.
+
+## ESPHome manifest
+
+A manifest now requires both an existing model and an explicit or evaluated
+threshold. It will not silently publish the previous placeholder cutoff.
+
+```bash
+python scripts/emit_manifest.py \
+  --project xingxing \
+  --eval-json eval/results/xingxing-v0__latest.json
+```
+
+The generated JSON can be referenced by ESPHome:
+
+```yaml
+micro_wake_word:
+  microphone: wake_mic
+  vad:
+  models:
+    - model: https://example.com/xingxing/manifest.json
+```
+
+ESPHome's model JSON contains the model path, language, probability cutoff,
+sliding-window size, feature step, and tensor arena requirement.
+
+## Cloud training
+
+RunPod and Lambda helpers provision a host and execute synthesis, feature
+generation, and training:
+
+```bash
+python scripts/runpod_train.py --project xingxing
+python scripts/lambda_train.py --project xingxing
+```
+
+Read `RUNPOD_RECIPE.md` or `LAMBDA_SETUP.md` before use. These scripts incur
+cloud cost and require credentials. Generated data is gitignored, so held-out
+evaluation data must be mounted, uploaded, or evaluated after retrieving the
+model.
+
+## Repository layout
+
+```text
+configs/examples/<project>/
+  wake_phrases.yaml
+  hard_negatives.yaml
+  training_parameters.yaml
+
+scripts/
+  train_local_server.sh
+  init_wake.py
+  synth_positives.py
+  synth_hard_negatives.py
+  suggest_hard_negatives.py
+  download_hf_negatives.py
+  collect_negatives.py
+  build_features.py
+  train_microwakeword.py
+  seed_eval_tasks.py
+  emit_manifest.py
+  upload_to_hf.py
+  runpod_train.py
+  lambda_train.py
+
+eval/
+  runner.py
+  schema.py
+  tasks/<project>/
+  results/
+
+webui/
+  app.py
+```
+
+## Data and license
+
+Repository code is Apache 2.0.
+
+Training data and resulting model redistribution terms depend on the selected
+voices and corpora. In particular, the default precomputed microWakeWord
+negative datasets are marked CC-BY-NC-4.0 and are not suitable for a commercial
+model. Commercial projects must replace them with appropriately licensed
+speech, noise, music, and evaluation data and record the provenance in the
+model card.
 
 ## Status
 
-- **2026-05-15** — v0 scaffold landed. Generic toolkit + Tofu worked example. No models trained yet. See [`PLAN.md`](PLAN.md) for the next steps.
-
----
-
-## License
-
-Apache License 2.0 for the code in this repo. See [LICENSE](LICENSE).
-
-Training data — RIRs, bulk negatives — are downloaded from third parties at their own licenses (mostly CC-BY / CC0); see [`RESEARCH.md`](RESEARCH.md) for the per-corpus terms.
-
-Published `.tflite` artefacts default to Apache 2.0 — synthesized from permissively-licensed Piper / Kokoro / MeloTTS / Parler-TTS voices specifically so the model can ship without license entanglement.
+The pipeline code is implemented, but this repository does not include a
+trained or independently validated model. A release should only be considered
+complete after device-specific held-out evaluation and ESP32-S3 testing.

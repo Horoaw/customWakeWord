@@ -10,9 +10,9 @@ in the Space repo is all it needs. Locally: `python webui/app.py`.
 """
 from __future__ import annotations
 
-import io
 import json
 import os
+from collections import deque
 from pathlib import Path
 
 import gradio as gr
@@ -23,7 +23,6 @@ import numpy as np
 from ai_edge_litert.interpreter import Interpreter
 from huggingface_hub import hf_hub_download
 from scipy.signal import resample_poly
-from scipy.io import wavfile
 
 
 # Default project / HF repo. Override in a Space by setting the env vars
@@ -124,19 +123,20 @@ def run_model(interpreter: Interpreter, spectrogram: np.ndarray) -> list[float]:
 
     in_dtype = input_details[0]["dtype"]
     is_quant = in_dtype == np.int8
+    out_is_quant = np.issubdtype(output_details[0]["dtype"], np.integer)
     n_slices = int(input_details[0]["shape"][1])
     in_scale, in_zp = (input_details[0]["quantization_parameters"]["scales"][0],
                        input_details[0]["quantization_parameters"]["zero_points"][0]) if is_quant else (1.0, 0)
     out_scale, out_zp = (output_details[0]["quantization_parameters"]["scales"][0],
-                         output_details[0]["quantization_parameters"]["zero_points"][0]) if is_quant else (1.0, 0)
+                         output_details[0]["quantization_parameters"]["zero_points"][0]) if out_is_quant else (1.0, 0)
 
-    # Scale uint16-encoded spectrograms to float32 like upstream does.
     spec = spectrogram
-    if np.issubdtype(spec.dtype, np.uint16):
-        spec = spec.astype(np.float32) * 0.0390625
+    reset = getattr(interpreter, "reset_all_variables", None)
+    if reset:
+        reset()
 
     probs = []
-    stride = n_slices  # non-overlapping windows for a quick UI; tweak if needed
+    stride = n_slices  # each inference consumes the next streaming feature block
     for end in range(n_slices, len(spec) + 1, stride):
         chunk = spec[end - n_slices: end]
         if is_quant:
@@ -148,10 +148,19 @@ def run_model(interpreter: Interpreter, spectrogram: np.ndarray) -> list[float]:
                                    chunk.astype(np.float32).reshape(input_details[0]["shape"]))
         interpreter.invoke()
         raw = interpreter.get_tensor(output_details[0]["index"])[0][0]
-        prob = float((raw - out_zp) * out_scale) if is_quant else float(raw)
+        prob = float((raw - out_zp) * out_scale) if out_is_quant else float(raw)
         probs.append(prob)
 
     return probs
+
+
+def smooth_probabilities(probabilities: list[float], window_size: int) -> list[float]:
+    window: deque[float] = deque(maxlen=max(1, window_size))
+    smoothed = []
+    for probability in probabilities:
+        window.append(probability)
+        smoothed.append(sum(window) / len(window))
+    return smoothed
 
 
 def predict(hf_repo: str, audio) -> tuple[str, float, "plt.Figure | None"]:
@@ -165,7 +174,9 @@ def predict(hf_repo: str, audio) -> tuple[str, float, "plt.Figure | None"]:
 
     interp, manifest, cutoff = load_model(hf_repo)
     spec = spectrogram_from_pcm(pcm)
-    probs = run_model(interp, spec)
+    raw_probs = run_model(interp, spec)
+    window_size = int(manifest.get("micro", {}).get("sliding_window_size", 5))
+    probs = smooth_probabilities(raw_probs, window_size)
     if not probs:
         return "Clip is shorter than the model's window. Speak for at least 1 s.", 0.0, None
 

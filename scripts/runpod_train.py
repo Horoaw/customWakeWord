@@ -120,13 +120,18 @@ def build_train_script(project: str, repo_url: str, branch: str,
     upload_block = ""
     if hf_repo_id:
         upload_block = (
-            f"\n    write_stage \"upload_to_hf\"\n"
-            f"    echo \"[$(date +%H:%M:%S)] uploading to HF\"\n"
-            f"    python scripts/upload_to_hf.py --project {project} \\\n"
-            f"        --model models/{project}-wakeword-v0.tflite \\\n"
-            f"        --repo-id {hf_repo_id} \\\n"
-            f"        --eval-json eval/results/{project}-v0__latest.json \\\n"
-            f"        --esphome configs/examples/{project}/manifest.json\n"
+            f"\n    if [ -s eval/results/{project}-v0__latest.json ] && "
+            f"[ -s configs/examples/{project}/manifest.json ]; then\n"
+            f"        write_stage \"upload_to_hf\"\n"
+            f"        echo \"[$(date +%H:%M:%S)] uploading to HF\"\n"
+            f"        python scripts/upload_to_hf.py --project {project} \\\n"
+            f"            --model models/{project}-wakeword-v0.tflite \\\n"
+            f"            --repo-id {hf_repo_id} \\\n"
+            f"            --eval-json eval/results/{project}-v0__latest.json \\\n"
+            f"            --esphome configs/examples/{project}/manifest.json\n"
+            f"    else\n"
+            f"        echo \"Skipping HF upload: seed and run held-out eval first\"\n"
+            f"    fi\n"
         )
 
     return rf"""
@@ -250,17 +255,19 @@ disown
 
     # 6. Eval against held-out tasks (if seeded)
     write_stage "eval"
-    if [ -d "eval/tasks/{project}" ]; then
+    if find "eval/tasks/{project}" -name '*.json' -print -quit 2>/dev/null | grep -q .; then
         python -m eval.runner --project {project} \
             --model models/{project}-wakeword-v0.tflite \
             --out eval/results/{project}-v0__$(date +%s).json
         cp $(ls -t eval/results/{project}-v0__*.json | head -1) \
            eval/results/{project}-v0__latest.json
+        write_stage "emit_manifest"
+        python scripts/emit_manifest.py --project {project} \
+            --eval-json eval/results/{project}-v0__latest.json
+    else
+        echo "No held-out eval tasks found; model exported, manifest intentionally skipped"
     fi
 
-    # 7. Emit manifest
-    write_stage "emit_manifest"
-    python scripts/emit_manifest.py --project {project}
     {upload_block}
     write_stage "done"
     echo "[$(date +%H:%M:%S)] DONE"

@@ -44,55 +44,11 @@ RUN /opt/venv/bin/pip install --upgrade pip wheel
 COPY requirements.txt /tmp/requirements.txt
 RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Install microwakeword editably from a local clone with patched __init__.py
-# files. Upstream OHF-Voice/micro-wake-word's setup.py uses
-# `find_packages()`, but the `audio/` and `layers/` subdirectories ship
-# without __init__.py — so a normal install drops them entirely and
-# `from microwakeword.audio.augmentation import Augmentation` errors
-# with ModuleNotFoundError. We patch them in before the editable install,
-# then sanity-check the import works.
-RUN git clone --depth 1 https://github.com/OHF-Voice/micro-wake-word.git \
-        /opt/microwakeword \
-    && touch /opt/microwakeword/microwakeword/audio/__init__.py \
-    && touch /opt/microwakeword/microwakeword/layers/__init__.py \
-    && sed -i \
-        -e 's/result\["fp"\]\.numpy()/np.asarray(result["fp"])/g' \
-        -e 's/ambient_predictions\["tp"\]\.numpy()/np.asarray(ambient_predictions["tp"])/g' \
-        -e 's/ambient_predictions\["fp"\]\.numpy()/np.asarray(ambient_predictions["fp"])/g' \
-        -e 's/ambient_predictions\["fn"\]\.numpy()/np.asarray(ambient_predictions["fn"])/g' \
-        /opt/microwakeword/microwakeword/train.py \
-    && grep -q 'np\.asarray(result\["fp"\])' /opt/microwakeword/microwakeword/train.py \
-    && /opt/venv/bin/pip install --no-cache-dir -e /opt/microwakeword \
-    && /opt/venv/bin/python -c \
-        "from microwakeword.audio.augmentation import Augmentation; \
-         from microwakeword.audio.clips import Clips; \
-         from microwakeword.audio.spectrograms import SpectrogramGeneration; \
-         print('microwakeword.audio OK')"
-
-# Pre-clone piper-sample-generator at v2.0.0 — saves another 30s on the pod.
-# PIN: v2.0.0 is the last release with the old `generate_samples.py` at the
-# repo root. v3.x reorganized into the `piper_sample_generator` package +
-# `python -m piper_sample_generator` invocation, and dropped the implicit
-# model resolution that our synth scripts rely on (they don't pass --model).
-# Stay on v2.0.0 until scripts/synth_*.py migrates to the new API.
-#
-# Inline patch: PyTorch 2.6 flipped `torch.load`'s default `weights_only`
-# from False → True. The libritts_r-medium.pt checkpoint contains
-# `piper_train.vits.models.SynthesizerTrn` which is not on the safe-globals
-# allowlist, so the default load fails. We trust the upstream checkpoint,
-# so add `weights_only=False`. Failing to patch produces:
-#   _pickle.UnpicklingError: Weights only load failed. ... WeightsUnpickler
-#   error: Unsupported global: GLOBAL piper_train.vits.models.SynthesizerTrn
-RUN git clone --depth 1 --branch v2.0.0 \
-        https://github.com/rhasspy/piper-sample-generator.git \
-        /opt/piper-sample-generator \
-    && mkdir -p /opt/piper-sample-generator/models \
-    && wget -q -O /opt/piper-sample-generator/models/en_US-libritts_r-medium.pt \
-        https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt \
-    && test -f /opt/piper-sample-generator/generate_samples.py \
-    && sed -i 's/torch\.load(model_path)/torch.load(model_path, weights_only=False)/' \
-        /opt/piper-sample-generator/generate_samples.py \
-    && grep -q 'weights_only=False' /opt/piper-sample-generator/generate_samples.py
+# Pin and install the two source-only dependencies through the same script used
+# by Lambda. This avoids Docker/Lambda drift when either upstream main changes.
+COPY scripts/install_training_stack.sh /tmp/install_training_stack.sh
+RUN PYTHON_BIN=/opt/venv/bin/python INSTALL_ROOT=/opt \
+        bash /tmp/install_training_stack.sh
 
 # Sanity check — fail the build if any critical import breaks
 RUN /opt/venv/bin/python -c "import tensorflow as tf; print('tf', tf.__version__)" \

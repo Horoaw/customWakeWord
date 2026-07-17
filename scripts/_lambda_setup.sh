@@ -75,6 +75,13 @@ write_stage "pip_install_requirements"
 pip install --no-cache-dir -r requirements.txt
 echo "[$(date +%H:%M:%S)] deps installed: $(python --version)"
 
+write_stage "install_training_stack"
+# Installs the same pinned microWakeWord + Piper Sample Generator revisions as
+# the Docker image. The previous Lambda path installed requirements.txt only,
+# leaving both source-only dependencies absent.
+INSTALL_ROOT=/workspace PYTHON_BIN=python \
+    bash scripts/install_training_stack.sh
+
 write_stage "synth_positives"
 if [ ! -s "data/${PROJECT}/synth/positives/manifest.jsonl" ]; then
     python scripts/synth_positives.py --project "$PROJECT" \
@@ -103,25 +110,28 @@ python scripts/train_microwakeword.py --project "$PROJECT" \
     --training-config "configs/examples/${PROJECT}/training_parameters.yaml"
 
 write_stage "eval"
-if [ -d "eval/tasks/${PROJECT}" ]; then
+if find "eval/tasks/${PROJECT}" -name '*.json' -print -quit 2>/dev/null | grep -q .; then
     python -m eval.runner --project "$PROJECT" \
         --model "models/${PROJECT}-wakeword-v0.tflite" \
         --out "eval/results/${PROJECT}-v0__$(date +%s).json"
     cp $(ls -t eval/results/${PROJECT}-v0__*.json | head -1) \
        eval/results/${PROJECT}-v0__latest.json
-fi
 
-write_stage "emit_manifest"
-python scripts/emit_manifest.py --project "$PROJECT"
+    write_stage "emit_manifest"
+    python scripts/emit_manifest.py --project "$PROJECT" \
+        --eval-json "eval/results/${PROJECT}-v0__latest.json"
 
-if [ -n "$HF_REPO_ID" ]; then
-    write_stage "upload_to_hf"
-    echo "[$(date +%H:%M:%S)] uploading to HF: ${HF_REPO_ID}"
-    python scripts/upload_to_hf.py --project "$PROJECT" \
-        --model "models/${PROJECT}-wakeword-v0.tflite" \
-        --repo-id "$HF_REPO_ID" \
-        --eval-json "eval/results/${PROJECT}-v0__latest.json" \
-        --esphome "configs/examples/${PROJECT}/manifest.json"
+    if [ -n "$HF_REPO_ID" ]; then
+        write_stage "upload_to_hf"
+        echo "[$(date +%H:%M:%S)] uploading to HF: ${HF_REPO_ID}"
+        python scripts/upload_to_hf.py --project "$PROJECT" \
+            --model "models/${PROJECT}-wakeword-v0.tflite" \
+            --repo-id "$HF_REPO_ID" \
+            --eval-json "eval/results/${PROJECT}-v0__latest.json" \
+            --esphome "configs/examples/${PROJECT}/manifest.json"
+    fi
+else
+    echo "No held-out eval tasks found; model exported, manifest and upload skipped"
 fi
 
 write_stage "done"

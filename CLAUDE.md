@@ -12,7 +12,8 @@ A pipeline for training custom wake-word models from a single phrase:
 user phrase  →  init_wake.py  →  TTS synth  →  augment  →  microWakeWord train  →  INT8 .tflite  →  HF Hub + ESPHome
 ```
 
-The "user phrase" is the only required input. Everything else has sensible defaults under `configs/`. The pipeline is meant to be re-run for many wake words; each lives under its own project slug.
+The phrase initializes a baseline project, but a release also requires held-out
+audio, an evaluated threshold, and target-device validation.
 
 ---
 
@@ -21,18 +22,17 @@ The "user phrase" is the only required input. Everything else has sensible defau
 | Path | Purpose |
 |---|---|
 | `scripts/init_wake.py` | Bootstrap a new wake-word project from a CLI flag |
-| `scripts/synth_positives.py` | TTS-driven positive synthesis (Piper/Kokoro/MeloTTS/Parler) |
+| `scripts/synth_positives.py` | Piper TTS synthesis (English generator or configured ONNX voices) |
 | `scripts/synth_hard_negatives.py` | TTS adversarials |
 | `scripts/suggest_hard_negatives.py` | LLM-driven collision generator (Together/OpenAI/Ollama) |
 | `scripts/collect_negatives.py` | Bulk negative corpora download |
-| `scripts/build_features.py` | WAV → TFRecord with augmentation |
-| `scripts/train_microwakeword.py` | TF/Keras training loop |
+| `scripts/build_features.py` | WAV → RaggedMmap MicroFrontend features with augmentation |
+| `scripts/train_microwakeword.py` | Upstream MixedNet training + streaming INT8 export |
 | `scripts/runpod_train.py` | RunPod A40 launcher with log server on :8001 |
-| `scripts/export_tflite.py` | INT8 PTQ → tflite-micro |
+| `scripts/emit_manifest.py` | Validated ESPHome v2 model manifest |
 | `scripts/upload_to_hf.py` | HF Hub model + model card emit |
 | `eval/runner.py` | FRR + FAR/hour scorer |
-| `configs/examples/<slug>/` | Per-project phrase + hard-neg YAML |
-| `configs/{data,train}.yaml` | Shared config across all projects |
+| `configs/examples/<slug>/` | Phrase, hard-negative, and training YAML |
 | `data/<slug>/` | Per-project audio + features (gitignored) |
 | `models/` | Trained .tflite (gitignored) |
 
@@ -65,7 +65,8 @@ Each slash command is a thin trigger; the real logic lives in the subagent file 
 
 5. **Match the user's wake-word target**:
    - Default is `microWakeWord` for ESP32-S3 (INT8 TFLite Micro).
-   - If the user asks for "Raspberry Pi" or "openWakeWord", swap `train_microwakeword.py` → an openWakeWord variant (not yet shipped — note and offer to write).
+   - If the user asks for Raspberry Pi/openWakeWord or ESP-SR/WakeNet, state that
+     the requested training/export path is not shipped in this repository.
 
 6. **When unsure**: read [`PIPELINE.md`](PIPELINE.md), [`PLAN.md`](PLAN.md), [`EXAMPLES.md`](EXAMPLES.md). They are the authoritative docs.
 
@@ -73,10 +74,10 @@ Each slash command is a thin trigger; the real logic lives in the subagent file 
 
 ## Defaults
 
-- Project slug: lowercase, no spaces (`tofu`, `sunny`, `jarvis`).
+- Project slug: Unicode-safe with no spaces; ASCII ids remain recommended for cloud tooling.
 - Default positives count: 10,000 across 4 phrases (5k + 2.5k + 1.5k + 1k).
 - Default hard-negs count: 2,500.
-- Default bulk negatives: 300 h sampled from MUSAN + DEMAND + Common Voice + AudioSet.
+- Default training negatives: upstream precomputed speech and dinner-party features.
 - Default GPU: A40 SECURE on RunPod (~$0.39/hr).
 - Default eval thresholds: target FRR ≤ 5%, FAR/hour ≤ 1.0, .tflite ≤ 100 kB.
 

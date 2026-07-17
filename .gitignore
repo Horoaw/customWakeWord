@@ -63,6 +63,7 @@ data/noise/
 
 # TFLite artefacts may be checked in deliberately under models/, but not in data dirs
 data/**/*.tflite
+data/tts_models/
 # (root models/ is gitignored separately; explicit releases go via git-lfs or HF Hub)
 models/*.tflite
 
@@ -78,6 +79,8 @@ Thumbs.db
 local_notes/
 scratch/
 secrets/
+piper-sample-generator/
+.tmp_upstream_mww/
 
 # Claude Code state (per-session, never commit)
 .claude/state/

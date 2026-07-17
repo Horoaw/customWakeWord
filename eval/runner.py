@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import math
 import time
+from collections import deque
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
@@ -28,7 +30,7 @@ def load_tasks(tasks_dir: Path) -> list[EvalTask]:
         if not d.exists():
             continue
         for jp in sorted(d.glob("*.json")):
-            data = json.loads(jp.read_text())
+            data = json.loads(jp.read_text(encoding="utf-8"))
             out.append(EvalTask(**data))
     return out
 
@@ -44,17 +46,25 @@ def load_audio(path: str, target_sr: int = 16000) -> np.ndarray:
     return audio
 
 
-def compute_log_mel(audio, sr, n_mels=40, win_ms=60, hop_ms=25,
-                    fmin=20, fmax=7600) -> np.ndarray:
-    import librosa
-    win_length = int(sr * win_ms / 1000)
-    hop_length = int(sr * hop_ms / 1000)
-    n_fft = 1 << (win_length - 1).bit_length()
-    mel = librosa.feature.melspectrogram(
-        y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-        n_mels=n_mels, fmin=fmin, fmax=fmax, power=2.0,
-    )
-    return librosa.power_to_db(mel, ref=np.max).astype(np.float32)
+def compute_micro_features(audio: np.ndarray) -> np.ndarray:
+    """Generate the same 40-channel MicroFrontend features used in training."""
+    from pymicro_features import MicroFrontend
+
+    pcm16 = np.clip(audio * 32768.0, -32768, 32767).astype(np.int16)
+    audio_bytes = pcm16.tobytes()
+    frontend = MicroFrontend()
+    features = []
+    idx = 0
+    while idx + 160 * 2 < len(audio_bytes):
+        result = frontend.process_samples(audio_bytes[idx: idx + 160 * 2])
+        if result.samples_read <= 0:
+            break
+        idx += result.samples_read * 2
+        if result.features:
+            features.append(result.features)
+    if not features:
+        return np.empty((0, 40), dtype=np.float32)
+    return np.asarray(features, dtype=np.float32)
 
 
 class TFLiteRunner:
@@ -67,61 +77,85 @@ class TFLiteRunner:
         self.interp.allocate_tensors()
         self.in_details = self.interp.get_input_details()[0]
         self.out_details = self.interp.get_output_details()[0]
-        self.in_shape = self.in_details["shape"]   # e.g. [1, 40, 194]
+        self.in_shape = tuple(int(v) for v in self.in_details["shape"])
+        if self.in_shape[-1] != 40:
+            raise ValueError(f"expected a 40-feature streaming input, got {self.in_shape}")
+        self.n_slices = math.prod(self.in_shape) // 40
         # INT8 input quant params
         self.in_scale, self.in_zero = self.in_details.get("quantization", (1.0, 0))
         self.out_scale, self.out_zero = self.out_details.get("quantization", (1.0, 0))
 
+    def reset(self) -> None:
+        reset = getattr(self.interp, "reset_all_variables", None)
+        if reset:
+            reset()
+
     def predict(self, features: np.ndarray) -> float:
         """Run a single window through the model. Returns float probability in [0, 1]."""
-        if self.in_details["dtype"] == np.int8:
+        in_dtype = self.in_details["dtype"]
+        if np.issubdtype(in_dtype, np.integer):
             q = np.round(features / max(self.in_scale, 1e-9) + self.in_zero).astype(np.int32)
-            q = np.clip(q, -128, 127).astype(np.int8)
+            limits = np.iinfo(in_dtype)
+            q = np.clip(q, limits.min, limits.max).astype(in_dtype)
             inp = q.reshape(self.in_shape)
         else:
             inp = features.astype(np.float32).reshape(self.in_shape)
         self.interp.set_tensor(self.in_details["index"], inp)
         self.interp.invoke()
         out = self.interp.get_tensor(self.out_details["index"])
-        if self.out_details["dtype"] == np.int8:
+        if np.issubdtype(self.out_details["dtype"], np.integer):
             return float((int(out.flat[0]) - self.out_zero) * self.out_scale)
         return float(out.flat[0])
 
 
-def stream_features(audio: np.ndarray, sr: int, n_frames: int,
-                    hop_features: int = 20) -> list[np.ndarray]:
-    """Slide an `n_frames`-long mel window over the clip with `hop_features` of stride."""
-    mel = compute_log_mel(audio, sr)
-    t = mel.shape[1]
-    if t <= n_frames:
-        # Pad single window
-        if t < n_frames:
-            mel = np.pad(mel, ((0, 0), (0, n_frames - t)), mode="constant")
-        return [mel]
-    out = []
-    start = 0
-    while start + n_frames <= t:
-        out.append(mel[:, start:start + n_frames])
-        start += hop_features
-    return out
+def stream_features(audio: np.ndarray, n_slices: int) -> list[np.ndarray]:
+    """Split MicroFrontend output into the chunks expected by the streaming model."""
+    features = compute_micro_features(audio)
+    if not len(features):
+        return []
+    usable = len(features) - (len(features) % n_slices)
+    return [features[i:i + n_slices] for i in range(0, usable, n_slices)]
+
+
+def detection_events(probabilities: list[float], threshold: float,
+                     sliding_window_size: int, step_ms: int) -> tuple[list[float], int]:
+    """Apply ESPHome-style probability smoothing and count distinct detections."""
+    window: deque[float] = deque(maxlen=max(1, sliding_window_size))
+    smoothed: list[float] = []
+    events = 0
+    active = False
+    for probability in probabilities:
+        window.append(probability)
+        average = sum(window) / len(window)
+        smoothed.append(average)
+        above = len(window) == window.maxlen and average >= threshold
+        if above and not active:
+            events += 1
+        active = above
+    return smoothed, events
 
 
 def run_one(runner: TFLiteRunner, task: EvalTask, threshold: float,
-            n_frames: int = 194) -> EvalResult:
+            sliding_window_size: int = 5, feature_step_ms: int = 10) -> EvalResult:
     t0 = time.time()
     try:
         audio = load_audio(task.audio_path)
-        windows = stream_features(audio, 16000, n_frames)
+        runner.reset()
+        windows = stream_features(audio, runner.n_slices)
         probs = [runner.predict(w) for w in windows]
+        smoothed, fire_count = detection_events(
+            probs, threshold, sliding_window_size,
+            feature_step_ms * runner.n_slices,
+        )
     except Exception as e:
         return EvalResult(
             task_id=task.id, label=task.label, bucket_id=task.bucket_id,
             fired=False, expected_fire=(task.expected == "fire"), passed=False,
-            max_probability=0.0, fire_count=0, duration_s=time.time() - t0,
+            max_probability=0.0, fire_count=0, duration_s=0.0,
+            processing_time_s=time.time() - t0,
             error_msg=str(e),
         )
-    max_prob = max(probs) if probs else 0.0
-    fire_count = sum(1 for p in probs if p >= threshold)
+    max_prob = max(smoothed) if smoothed else 0.0
     fired = fire_count > 0
     expected_fire = task.expected == "fire"
     passed = (fired == expected_fire)
@@ -129,12 +163,13 @@ def run_one(runner: TFLiteRunner, task: EvalTask, threshold: float,
         task_id=task.id, label=task.label, bucket_id=task.bucket_id,
         fired=fired, expected_fire=expected_fire, passed=passed,
         max_probability=max_prob, fire_count=fire_count,
-        duration_s=time.time() - t0,
+        duration_s=len(audio) / 16000.0,
+        processing_time_s=time.time() - t0,
     )
 
 
 def summarize(results: list[EvalResult], threshold: float, project: str,
-              model_path: str, bulk_minutes: float) -> EvalSummary:
+              model_path: str, bulk_minutes: float | None = None) -> EvalSummary:
     pos = [r for r in results if r.label == "positive"]
     hn = [r for r in results if r.label == "hard_negative"]
     bulk = [r for r in results if r.label == "bulk_negative"]
@@ -146,7 +181,9 @@ def summarize(results: list[EvalResult], threshold: float, project: str,
 
     # FAR/hour from bulk: each bulk task is treated as a small slice; sum fire counts
     # and divide by total bulk audio duration in hours.
-    bulk_fires = sum(r.fire_count for r in bulk)
+    bulk_fires = sum(r.fire_count for r in bulk if not r.error_msg)
+    if bulk_minutes is None:
+        bulk_minutes = sum(r.duration_s for r in bulk if not r.error_msg) / 60.0
     far_per_hour = bulk_fires / max(bulk_minutes / 60.0, 1e-6) if bulk_minutes > 0 else 0.0
 
     per_bucket = defaultdict(list)
@@ -180,9 +217,10 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     ap.add_argument("--threshold", type=float, default=0.85,
                     help="Detection threshold; FAR/FRR computed at this op-point.")
-    ap.add_argument("--n-frames", type=int, default=194)
-    ap.add_argument("--bulk-minutes", type=float, default=60.0,
-                    help="Total minutes of bulk audio in the eval set (for FAR/hour denom).")
+    ap.add_argument("--sliding-window-size", type=int, default=5)
+    ap.add_argument("--feature-step-ms", type=int, default=10)
+    ap.add_argument("--bulk-minutes", type=float, default=None,
+                    help="Override measured bulk audio duration (normally auto-calculated).")
     args = ap.parse_args()
 
     tasks_dir = Path(args.tasks) if args.tasks else Path(f"eval/tasks/{args.project}")
@@ -200,7 +238,8 @@ def main() -> int:
     for i, task in enumerate(tasks):
         if i % 25 == 0:
             print(f"  [{i}/{len(tasks)}]")
-        r = run_one(runner, task, args.threshold, args.n_frames)
+        r = run_one(runner, task, args.threshold, args.sliding_window_size,
+                    args.feature_step_ms)
         results.append(r)
 
     summary = summarize(results, args.threshold, args.project,
@@ -208,7 +247,7 @@ def main() -> int:
     print()
     print(f"  FRR:          {summary.frr:.2%}")
     print(f"  FAR/hour:     {summary.far_per_hour:.2f}")
-    print(f"  per-bucket FAR:")
+    print("  per-bucket FAR:")
     for bid, val in sorted(summary.per_bucket_far.items()):
         print(f"    {bid}: {val:.2%}")
 
@@ -219,7 +258,7 @@ def main() -> int:
     out_path.write_text(json.dumps({
         "summary": asdict(summary),
         "results": [asdict(r) for r in results],
-    }, indent=2))
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nSaved to {out_path}")
     return 0
 
